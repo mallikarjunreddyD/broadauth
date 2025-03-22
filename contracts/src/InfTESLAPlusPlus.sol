@@ -3,6 +3,7 @@ pragma solidity ^0.8.12;
 
 contract InfTESLAplusplus {
     address cm = msg.sender;
+
     struct rcd {
         bool isTaken;
         address owner;
@@ -13,7 +14,9 @@ contract InfTESLAplusplus {
         mapping(uint => bool) isIndexExist;
         uint currentIndex;
     }
+
     mapping(uint => rcd) RCDs;
+
     modifier onlyCM() {
         require(msg.sender == cm, "only CM can call");
         _;
@@ -35,6 +38,10 @@ contract InfTESLAplusplus {
         uint _disclosurDelay
     ) public {
         require(
+            RCDs[_rcd].isTaken == true,
+            "Keys can be stored for only active RCDs"
+        );
+        require(
             RCDs[_rcd].owner == msg.sender,
             "Only owner of the RCD can call"
         );
@@ -46,10 +53,6 @@ contract InfTESLAplusplus {
             RCDs[_rcd].currentIndex == 0 ||
                 RCDs[_rcd].endTime[_index - 1] < _startTime,
             "New keychain can only be started after the old keychain ends"
-        );
-        require(
-            RCDs[_rcd].isTaken == true,
-            "Keys can be stored for only active RCDs"
         );
         RCDs[_rcd].key[_index] = _key;
         RCDs[_rcd].startTime[_index] = _startTime;
