@@ -1,1 +1,2 @@
-/internal/contract/
+/bin
+/internal/contract/contract.go

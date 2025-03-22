@@ -9,7 +9,7 @@ bin/%: cmd/% bin
 	go build -o $@ ./$<
 
 clean:
-	$(RM) -- ./bin/*
+	$(RM) -r -- ./bin
 
 fmt:
 	@go fmt ./cmd/* ./internal/* ./pkg/*
