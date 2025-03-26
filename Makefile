@@ -14,7 +14,9 @@ clean:
 fmt:
 	@go fmt ./cmd/* ./internal/* ./pkg/*
 
-test: internal/broadcast internal/slot pkg/hashchain
+test: internal/broadcast internal/slot pkg/hashchain internal/message internal/rx
 	cd internal/broadcast && go test -v
+	cd internal/message && go test -v
+	cd internal/rx && go test -v
 	cd internal/slot && go test -v
 	cd pkg/hashchain && go test -v
