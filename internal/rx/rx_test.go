@@ -12,11 +12,13 @@ import (
 
 func TestRx(t *testing.T) {
 	tx := tx.NewTx(uuid.New())
+	tx.Start()
+	defer tx.Stop()
 
 	go func() {
 		for t := range time.Tick(2 * time.Second) {
-			fmt.Println("Broadcasting message at ", t)
-			tx.Broadcast([]byte("Hello, world!"))
+			// fmt.Println("Broadcasting message at ", t)
+			tx.Broadcast([]byte(fmt.Sprintf("Hello, world! at time %v", t)))
 		}
 	}()
 
@@ -24,5 +26,5 @@ func TestRx(t *testing.T) {
 	rx.Start()
 	defer rx.Close()
 
-	time.Sleep(10 * time.Second)
+	time.Sleep(30 * time.Second)
 }

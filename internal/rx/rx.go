@@ -13,8 +13,10 @@ import (
 )
 
 type Rx struct {
-	slotSource    slot.SlotSource
-	receiver      broadcast.Receiver
+	slotSource slot.SlotSource
+	receiver   broadcast.Receiver
+
+	// TODO: Use a sophisticated key store with TTL and auto key expiration.
 	receivedHMACs sync.Map
 }
 
@@ -43,7 +45,7 @@ func (r *Rx) Start() error {
 			} else {
 				fmt.Println("Key message verification failed")
 			}
-			fmt.Println("Message: ", receivedMessage.Data[32:])
+			fmt.Println("Message: ", string(receivedMessage.Data[32:]))
 		} else {
 			fmt.Println("HMAC: ", receivedMessage.Data)
 
@@ -68,6 +70,8 @@ func (r *Rx) VerifyKeyMessage(receivedMessage *message.Message) bool {
 
 	// Calculate the HMAC of the payload.
 	key, payload := receivedMessage.Data[:32], receivedMessage.Data[32:]
+	fmt.Println("Verifying key message with key: ", key)
+
 	hmac := hmac.New(sha256.New, key)
 	hmac.Write(payload)
 	signature := hmac.Sum(nil)
