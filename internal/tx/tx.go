@@ -29,7 +29,7 @@ type Tx struct {
 
 type DisclosurePayload struct {
 	Message    []byte
-	Key        []byte
+	Key        [32]byte
 	TargetSlot uint64
 }
 
@@ -73,6 +73,8 @@ func (t *Tx) Broadcast(data []byte) error {
 		return fmt.Errorf("no more keys available in hashchain")
 	}
 
+	fmt.Println("Broadcasting with key: ", key)
+
 	// Calculate HMAC and broadcast it
 	signature := HMAC(key, data)
 	hmacMessage := message.NewMessage(t.ID, currentSlot, message.MessageKindHMAC, signature)
@@ -88,16 +90,18 @@ func (t *Tx) Broadcast(data []byte) error {
 
 	// Queue disclosure for later broadcast
 	targetSlot := currentSlot + t.disclosureDelay
+
+	keyArray := [32]byte{}
+	copy(keyArray[:], key)
 	select {
 	case t.disclosureMessages <- DisclosurePayload{
 		Message:    data,
-		Key:        key,
+		Key:        keyArray,
 		TargetSlot: targetSlot,
 	}:
 	default:
 		return fmt.Errorf("disclosure message queue is full")
 	}
-
 	return nil
 }
 
@@ -133,7 +137,7 @@ func (t *Tx) BroadcastWorker() {
 					t.ID,
 					currentSlot,
 					message.MessageKindKeyMessage,
-					append(disclosure.Key, disclosure.Message...),
+					append(disclosure.Key[:], disclosure.Message...),
 				)
 
 				data, err := disclosureMsg.Marshal()
