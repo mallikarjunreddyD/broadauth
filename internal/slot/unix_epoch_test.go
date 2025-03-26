@@ -23,7 +23,12 @@ func TestUnixEpochSlotSource(t *testing.T) {
 func TestUnixEpochSlotSourceTicker(t *testing.T) {
 	slotSource := slot.NewUnixEpochSlotSource(2000)
 	ticker := slotSource.Ticker()
+	remaining := 5
 	for slot := range ticker {
 		fmt.Println(slot)
+		remaining--
+		if remaining <= 0 {
+			break
+		}
 	}
 }
