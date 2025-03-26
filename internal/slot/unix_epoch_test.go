@@ -1,6 +1,7 @@
 package slot_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -16,5 +17,13 @@ func TestUnixEpochSlotSource(t *testing.T) {
 
 	if slotNum != slot.Slot(time.Now().UnixMilli()/2000) {
 		t.Fatalf("slot is not the current unix epoch")
+	}
+}
+
+func TestUnixEpochSlotSourceTicker(t *testing.T) {
+	slotSource := slot.NewUnixEpochSlotSource(2000)
+	ticker := slotSource.Ticker()
+	for slot := range ticker {
+		fmt.Println(slot)
 	}
 }
