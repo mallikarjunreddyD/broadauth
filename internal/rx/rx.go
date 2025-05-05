@@ -20,14 +20,18 @@ type Rx struct {
 	receivedHMACs sync.Map
 }
 
-func NewRx() *Rx {
-	receiver, err := broadcast.NewUDPReceiver(broadcast.DefaultUDPConfig())
+func NewRxWithUDPConfig(config broadcast.UDPConfig) *Rx {
+	receiver, err := broadcast.NewUDPReceiver(config)
 	if err != nil {
 		panic(err)
 	}
 	// TODO: Make this configurable.
 	slotSource := slot.NewUnixEpochSlotSource(2000)
 	return &Rx{slotSource: slotSource, receiver: receiver}
+}
+
+func NewRx() *Rx {
+	return NewRxWithUDPConfig(broadcast.DefaultUDPConfig())
 }
 
 func (r *Rx) Start() error {

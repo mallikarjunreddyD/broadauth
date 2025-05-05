@@ -33,8 +33,8 @@ type DisclosurePayload struct {
 	TargetSlot uint64
 }
 
-func NewTx(id uuid.UUID) *Tx {
-	broadcaster, err := broadcast.NewUDPBroadcaster(broadcast.DefaultUDPConfig())
+func NewTxWithUDPConfig(id uuid.UUID, config broadcast.UDPConfig) *Tx {
+	broadcaster, err := broadcast.NewUDPBroadcaster(config)
 	if err != nil {
 		panic(err)
 	}
@@ -50,9 +50,13 @@ func NewTx(id uuid.UUID) *Tx {
 	}
 }
 
+func NewTx(id uuid.UUID) *Tx {
+	return NewTxWithUDPConfig(id, broadcast.DefaultUDPConfig())
+}
+
 func (t *Tx) Start() error {
 	t.ctx, t.cancel = context.WithCancel(context.Background())
-	go t.BroadcastWorker()
+	go t.DisclosureBroadcastWorker()
 	return nil
 }
 
@@ -105,7 +109,7 @@ func (t *Tx) Broadcast(data []byte) error {
 	return nil
 }
 
-func (t *Tx) BroadcastWorker() {
+func (t *Tx) DisclosureBroadcastWorker() {
 	ticker := t.slotSource.Ticker()
 	pendingDisclosures := make([]DisclosurePayload, 0)
 
