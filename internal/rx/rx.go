@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sync"
 
@@ -51,7 +52,7 @@ func (r *Rx) Start() error {
 			}
 			fmt.Println("Message: ", string(receivedMessage.Data[32:]))
 		} else {
-			fmt.Println("HMAC: ", receivedMessage.Data)
+			fmt.Println("HMAC: ", hex.EncodeToString(receivedMessage.Data))
 
 			// TODO: Verify if the HMAC is of correct length.
 			var keyArray [32]byte
@@ -74,7 +75,7 @@ func (r *Rx) VerifyKeyMessage(receivedMessage *message.Message) bool {
 
 	// Calculate the HMAC of the payload.
 	key, payload := receivedMessage.Data[:32], receivedMessage.Data[32:]
-	fmt.Println("Verifying key message with key: ", key)
+	fmt.Println("Verifying key message with key: ", hex.EncodeToString(key))
 
 	hmac := hmac.New(sha256.New, key)
 	hmac.Write(payload)
