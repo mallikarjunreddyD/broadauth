@@ -1,3 +1,5 @@
+// Package tx is deprecated. Use the RCD implementation instead.
+// This package will be removed in a future release.
 package tx
 
 import (
@@ -13,6 +15,7 @@ import (
 	"github.com/virinci/broadauth/pkg/hashchain"
 )
 
+// Deprecated: Use RCD implementation instead.
 type Tx struct {
 	ID          uuid.UUID
 	broadcaster broadcast.Broadcaster
@@ -33,6 +36,7 @@ type DisclosurePayload struct {
 	TargetSlot uint64
 }
 
+// Deprecated: Use RCD implementation instead.
 func NewTxWithUDPConfig(id uuid.UUID, config broadcast.UDPConfig) *Tx {
 	broadcaster, err := broadcast.NewUDPBroadcaster(config)
 	if err != nil {
@@ -50,6 +54,7 @@ func NewTxWithUDPConfig(id uuid.UUID, config broadcast.UDPConfig) *Tx {
 	}
 }
 
+// Deprecated: Use RCD implementation instead.
 func NewTx(id uuid.UUID) *Tx {
 	return NewTxWithUDPConfig(id, broadcast.DefaultUDPConfig())
 }

@@ -1,6 +1,7 @@
 package slot_test
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -22,7 +23,10 @@ func TestUnixEpochSlotSource(t *testing.T) {
 
 func TestUnixEpochSlotSourceTicker(t *testing.T) {
 	slotSource := slot.NewUnixEpochSlotSource(2000)
-	ticker := slotSource.Ticker()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	ticker := slotSource.Ticker(ctx)
 	remaining := 5
 	for slot := range ticker {
 		fmt.Println(slot)

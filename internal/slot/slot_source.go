@@ -1,8 +1,10 @@
 package slot
 
+import "context"
+
 type SlotSource interface {
 	GetSlot() (Slot, error)
-	Ticker() <-chan Slot
+	Ticker(ctx context.Context) <-chan Slot
 }
 
 type Slot = uint64

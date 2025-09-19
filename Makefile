@@ -1,4 +1,4 @@
-all: bin/nothing
+all: bin/cm bin/cmtest bin/owner bin/rcd
 
 .PHONY: clean fmt test
 

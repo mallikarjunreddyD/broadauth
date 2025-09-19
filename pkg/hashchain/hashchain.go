@@ -1,6 +1,7 @@
 package hashchain
 
 import (
+	"fmt"
 	"hash"
 )
 
@@ -73,4 +74,42 @@ func (s *Linear) Next() []byte {
 
 func (s *Linear) Remaining() int {
 	return s.n - s.next + 1
+}
+
+// verifyChain checks if each hash in the chain properly links to the next one
+// h_i = hash(h_{i+1}) for i = 0 to n-1
+func verifyChain(hasher hash.Hash, chain []byte) bool {
+	hashLen := hasher.Size()
+	n := (len(chain) / hashLen) - 1
+
+	for i := range n {
+		curr := chain[i*hashLen : (i+1)*hashLen]
+		next := chain[(i+1)*hashLen : (i+2)*hashLen]
+
+		hasher.Reset()
+		hasher.Write(next)
+		expected := hasher.Sum(nil)
+
+		if string(curr) != string(expected) {
+			return false
+		}
+	}
+	return true
+}
+
+// NewLinearFromExisting creates a Linear hash chain from an existing chain of hashes.
+// The chain should be a concatenation of all hashes in order (h_0 || h_1 || ... || h_n).
+// The hasher must match the one used to create the original chain.
+func NewLinearFromExisting(hasher hash.Hash, chain []byte) (*Linear, error) {
+	hashLen := hasher.Size()
+	if len(chain)%hashLen != 0 {
+		return nil, fmt.Errorf("chain length must be multiple of hash size")
+	}
+	n := (len(chain) / hashLen) - 1 // -1 because n is the number of hashes after h_0
+
+	if !verifyChain(hasher, chain) {
+		return nil, fmt.Errorf("invalid hash chain")
+	}
+
+	return &Linear{hasher, n, chain, 1}, nil
 }

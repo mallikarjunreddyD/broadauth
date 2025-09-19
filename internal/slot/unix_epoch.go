@@ -1,6 +1,9 @@
 package slot
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 type UnixEpochSlotSource struct {
 	durationMilli uint64
@@ -14,13 +17,28 @@ func (s *UnixEpochSlotSource) GetSlot() (Slot, error) {
 	return Slot(uint64(time.Now().UnixMilli()) / s.durationMilli), nil
 }
 
-func (s *UnixEpochSlotSource) Ticker() <-chan Slot {
+func (s *UnixEpochSlotSource) Ticker(ctx context.Context) <-chan Slot {
 	ticker := time.NewTicker(time.Duration(s.durationMilli) * time.Millisecond)
 	ch := make(chan Slot)
+
 	go func() {
-		for range ticker.C {
-			ch <- Slot(uint64(time.Now().UnixMilli()) / s.durationMilli)
+		defer ticker.Stop()
+		defer close(ch)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				slot := Slot(uint64(time.Now().UnixMilli()) / s.durationMilli)
+				select {
+				case ch <- slot:
+				case <-ctx.Done():
+					return
+				}
+			}
 		}
 	}()
+
 	return ch
 }

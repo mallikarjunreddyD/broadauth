@@ -1,3 +1,5 @@
+// Package rx is deprecated. Use the RCD implementation instead.
+// This package will be removed in a future release.
 package rx
 
 import (
@@ -13,6 +15,7 @@ import (
 	"github.com/virinci/broadauth/internal/slot"
 )
 
+// Deprecated: Use RCD implementation instead.
 type Rx struct {
 	slotSource slot.SlotSource
 	receiver   broadcast.Receiver
@@ -21,6 +24,7 @@ type Rx struct {
 	receivedHMACs sync.Map
 }
 
+// Deprecated: Use RCD implementation instead.
 func NewRxWithUDPConfig(config broadcast.UDPConfig) *Rx {
 	receiver, err := broadcast.NewUDPReceiver(config)
 	if err != nil {
@@ -31,6 +35,7 @@ func NewRxWithUDPConfig(config broadcast.UDPConfig) *Rx {
 	return &Rx{slotSource: slotSource, receiver: receiver}
 }
 
+// Deprecated: Use RCD implementation instead.
 func NewRx() *Rx {
 	return NewRxWithUDPConfig(broadcast.DefaultUDPConfig())
 }
