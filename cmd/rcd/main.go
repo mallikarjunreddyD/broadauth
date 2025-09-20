@@ -48,7 +48,6 @@ func main() {
 		log.Fatalf("Failed to create RCD: %v", err)
 	}
 
-	log.Printf("Starting RCD simulation for %v...", cfg.SimulationTime)
 	if err := r.Start(); err != nil {
 		log.Fatalf("Failed to start RCD: %v", err)
 	}
@@ -71,5 +70,4 @@ func main() {
 	if err := r.Stop(); err != nil {
 		log.Printf("Error during shutdown: %v", err)
 	}
-	log.Printf("Simulation completed")
 }

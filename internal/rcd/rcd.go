@@ -26,10 +26,11 @@ import (
 )
 
 type RCD struct {
-	id              uuid.UUID
-	ownerAddr       string
-	ethClient       *ethclient.Client
-	contract        *contracts.Contract
+	id        uuid.UUID
+	ownerAddr string
+	ethClient *ethclient.Client
+	contract  *contracts.Contract
+
 	hashChain       *hashchain.Linear
 	hashchainLen    int
 	disclosureDelay uint64
@@ -42,7 +43,7 @@ type RCD struct {
 
 	disclosureMessages chan DisclosurePayload
 	receivedHMACs      sync.Map
-	commitmentKey      []byte
+	commitmentKeys     sync.Map // maps uuid.UUID to []byte
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -116,7 +117,7 @@ func New(cfg Config) (*RCD, error) {
 }
 
 func (r *RCD) Start() error {
-	log.Printf("Starting RCD with ID %s", r.id)
+	// log.Printf("Starting RCD with ID %s", r.id)
 	r.ctx, r.cancel = context.WithTimeout(context.Background(), r.simulationTime)
 
 	r.receiver.SetMessageHandler(r.handleMessage)
@@ -128,16 +129,16 @@ func (r *RCD) Start() error {
 	go r.broadcastLoop()
 	go r.disclosureWorker()
 
-	log.Printf("RCD started successfully")
+	// log.Printf("RCD started successfully")
 	return nil
 }
 
 func (r *RCD) Stop() error {
-	log.Printf("Stopping RCD with ID %s", r.id)
+	// log.Printf("Stopping RCD with ID %s", r.id)
 	r.cancel()
 	r.wg.Wait()
 	r.ethClient.Close()
-	log.Printf("RCD stopped successfully")
+	// log.Printf("RCD stopped successfully")
 	return nil
 }
 
@@ -145,15 +146,15 @@ func (r *RCD) RequestHashChain(currentSlot uint64) error {
 	const maxRetries = 3
 	var lastErr error
 
-	log.Printf("Starting hashchain request for slot %d", currentSlot)
+	// log.Printf("Starting hashchain request for slot %d", currentSlot)
 	for i := range maxRetries {
 		if err := r.requestHashChainOnce(currentSlot); err != nil {
 			lastErr = err
-			log.Printf("Attempt %d failed to request hashchain: %v", i+1, err)
+			// log.Printf("Attempt %d failed to request hashchain: %v", i+1, err)
 			time.Sleep(time.Second * time.Duration(i+1))
 			continue
 		}
-		log.Printf("Successfully received hashchain for slot %d", currentSlot)
+		// log.Printf("Successfully received hashchain for slot %d", currentSlot)
 		return nil
 	}
 	return fmt.Errorf("failed to request hashchain after %d attempts: %v", maxRetries, lastErr)
@@ -195,7 +196,7 @@ func (r *RCD) requestHashChainOnce(currentSlot uint64) error {
 
 func (r *RCD) broadcastLoop() {
 	defer r.wg.Done()
-	log.Printf("Starting broadcast loop")
+	// log.Printf("Starting broadcast loop")
 
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -203,13 +204,13 @@ func (r *RCD) broadcastLoop() {
 	for {
 		select {
 		case <-r.ctx.Done():
-			log.Printf("Broadcast loop stopping")
+			// log.Printf("Broadcast loop stopping")
 			return
 		case <-ticker.C:
 			msg := fmt.Sprintf("%s: mayday %d", r.id, r.messageCounter)
 			r.messageCounter++
 			if err := r.broadcast([]byte(msg)); err != nil {
-				log.Printf("Failed to broadcast: %v", err)
+				// log.Printf("Failed to broadcast: %v", err)
 			}
 		}
 	}
@@ -401,7 +402,7 @@ func (r *RCD) handleMessage(data []byte) {
 		log.Printf("Verified HMAC for key disclosure from %s", receivedMessage.SenderID)
 
 		log.Printf("Attempting to verify key from %s", receivedMessage.SenderID)
-		verified := r.verifyKey(key)
+		verified := r.verifyKey(receivedMessage.SenderID, key)
 		if verified {
 			log.Printf("Successfully verified message from %s: %s", receivedMessage.SenderID, string(payload))
 		} else {
@@ -415,11 +416,12 @@ func (r *RCD) handleMessage(data []byte) {
 	}
 }
 
-func (r *RCD) verifyKey(key []byte) bool {
-	if r.commitmentKey == nil {
-		log.Printf("No commitment key stored, fetching from contract for %s", r.id)
+func (r *RCD) verifyKey(senderID uuid.UUID, key []byte) bool {
+	commitmentKey, ok := r.commitmentKeys.Load(senderID)
+	if !ok {
+		log.Printf("No commitment key stored, fetching from contract for %s", senderID)
 
-		contractKey, startTime, endTime, delay, err := r.contract.GetKey(&bind.CallOpts{}, new(big.Int).SetBytes(r.id[:]))
+		contractKey, startTime, endTime, delay, err := r.contract.GetKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
 		if err != nil {
 			log.Printf("Failed to get key from contract: %v", err)
 			return false
@@ -430,34 +432,33 @@ func (r *RCD) verifyKey(key []byte) bool {
 			log.Printf("Contract returned empty key")
 			return false
 		}
-		r.commitmentKey = []byte(contractKey)
-		log.Printf("Stored commitment key of length %d", len(r.commitmentKey))
+		commitmentKey = []byte(contractKey)
+		r.commitmentKeys.Store(senderID, commitmentKey)
+		log.Printf("Stored commitment key of length %d for %s", len(commitmentKey.([]byte)), senderID)
 	}
 
 	currentKey := make([]byte, 32)
 	copy(currentKey, key)
 
-	if r.commitmentKey != nil && len(r.commitmentKey) > 0 {
-		if len(currentKey) == len(r.commitmentKey) && hmac.Equal(currentKey, r.commitmentKey) {
-			log.Printf("Key matches commitment directly (0 hashes)")
-			r.commitmentKey = currentKey
+	if len(currentKey) == len(commitmentKey.([]byte)) && hmac.Equal(currentKey, commitmentKey.([]byte)) {
+		log.Printf("Key matches commitment directly (0 hashes)")
+		r.commitmentKeys.Store(senderID, currentKey)
+		return true
+	}
+
+	log.Printf("Starting hash chain verification")
+	for i := range r.hashchainLen + 1 {
+		h := sha256.New()
+		h.Write(currentKey)
+		currentKey = h.Sum(nil)
+
+		if len(currentKey) == len(commitmentKey.([]byte)) && hmac.Equal(currentKey, commitmentKey.([]byte)) {
+			log.Printf("Key verified after %d hashes", i+1)
+			r.commitmentKeys.Store(senderID, key)
 			return true
 		}
-
-		log.Printf("Starting hash chain verification")
-		for i := range r.hashchainLen + 1 {
-			h := sha256.New()
-			h.Write(currentKey)
-			currentKey = h.Sum(nil)
-
-			if len(currentKey) == len(r.commitmentKey) && hmac.Equal(currentKey, r.commitmentKey) {
-				log.Printf("Key verified after %d hashes", i+1)
-				r.commitmentKey = key
-				return true
-			}
-		}
-		log.Printf("Key verification failed after 1024 hashes")
 	}
+	log.Printf("Key verification failed after %d hashes", r.hashchainLen)
 
 	return false
 }
