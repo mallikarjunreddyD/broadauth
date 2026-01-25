@@ -115,7 +115,7 @@ func (t *Tx) Broadcast(data []byte) error {
 }
 
 func (t *Tx) DisclosureBroadcastWorker() {
-	ticker := t.slotSource.Ticker()
+	ticker := t.slotSource.Ticker(context.Background())
 	pendingDisclosures := make([]DisclosurePayload, 0)
 
 	for {

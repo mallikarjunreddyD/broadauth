@@ -6,14 +6,14 @@ A playground for broadcast authentication algorithms.
 
 * Install the dependencies
 
-```
+```bash
 go get github.com/ethereum/go-ethereum
 go install github.com/ethereum/go-ethereum/cmd/abigen@latest
 ```
 
 * Build the smart contract along with ABI and bin information
 
-```
+```bash
 cd contracts
 forge build --extra-output-files={abi,bin}
 cd ..
@@ -21,30 +21,37 @@ cd ..
 
 * Generate Go bindings for the smart contract
 
-```
+```bash
 abigen --abi=contracts/out/InfTESLAPlusPlus.sol/InfTESLAplusplus.abi.json --bin=contracts/out/InfTESLAPlusPlus.sol/InfTESLAplusplus.bin --pkg=contract --type=Contract --out=internal/contract/contract.go
 
 abigen --abi contracts/out/Counter.sol/Counter.abi.json --bin contracts/out/Counter.sol/Counter.bin --pkg contract --type Counter --out internal/contract/contract.go
+```
+
+* Compile all the binaries
+
+```bash
+make
 ```
 
 ### Run the following blocks each in a separate terminal instance
 
 1. Run `anvil` with 12 seconds interval mining
 
-```
+```bash
 anvil --block-time 12 --host 0.0.0.0 --port 8545
 ```
 
 2. Deploy the smart contract on the local net
 
-```
+```bash
 cd contracts
 forge create src/InfTESLAPlusPlus.sol:InfTESLAplusplus --rpc-url 0.0.0.0:8545 --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 --broadcast
+cd ..
 ```
 
 3. Run the consortium manager on port `10101`. Private key must be the one used to deploy the contract.
 
-```
+```bash
 ./bin/cm \
     -eth-url http://0.0.0.0:8545 \
     -contract 0x5FbDB2315678afecb367f032d93F642f64180aa3 \
@@ -54,7 +61,7 @@ forge create src/InfTESLAPlusPlus.sol:InfTESLAplusplus --rpc-url 0.0.0.0:8545 --
 
 4. Run an owner on port `10102`
 
-```
+```bash
 ./bin/owner \
     -eth-url http://0.0.0.0:8545 \
     -contract 0x5FbDB2315678afecb367f032d93F642f64180aa3 \
@@ -62,12 +69,12 @@ forge create src/InfTESLAPlusPlus.sol:InfTESLAplusplus --rpc-url 0.0.0.0:8545 --
     -cm-addr 0.0.0.0:10101 \
     -disclosure-delay 2 \
     -hashchain-len 64 \
-    -port 10102 \
+    -port 10102
 ```
 
-5. Run an RCD
+5. Run an RCD (Change the uuid to use from the ones printed by the owner)
 
-```
+```bash
 ./bin/rcd \
     -contract 0x5FbDB2315678afecb367f032d93F642f64180aa3 \
     -disclosure-delay 2 \
