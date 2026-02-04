@@ -21,6 +21,7 @@ type MessageKind int
 const (
 	MessageKindHMAC       MessageKind = iota
 	MessageKindKeyMessage MessageKind = iota
+	MessageKindData       MessageKind = iota
 )
 
 func NewMessage(senderID uuid.UUID, slot slot.Slot, kind MessageKind, data []byte) *Message {

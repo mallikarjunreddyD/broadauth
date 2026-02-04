@@ -22,7 +22,15 @@ import (
 	contracts "github.com/virinci/broadauth/internal/contract"
 	"github.com/virinci/broadauth/internal/message"
 	"github.com/virinci/broadauth/internal/slot"
+	"github.com/virinci/broadauth/pkg/bloom"
 	"github.com/virinci/broadauth/pkg/hashchain"
+)
+
+type Mode int
+
+const (
+	ModeDeterministic Mode = iota
+	ModeProbabilistic
 )
 
 type RCD struct {
@@ -51,6 +59,11 @@ type RCD struct {
 
 	cachedKey     [32]byte
 	cachedKeySlot uint64
+
+	mode          Mode
+	messageBuffer [][]byte
+	bufferMutex   sync.Mutex
+	chainMutex    sync.Mutex
 }
 
 type DisclosurePayload struct {
@@ -67,6 +80,7 @@ type Config struct {
 	HashchainLen    int
 	DisclosureDelay uint64
 	SimulationTime  time.Duration
+	Mode            Mode
 }
 
 func New(cfg Config) (*RCD, error) {
@@ -113,6 +127,8 @@ func New(cfg Config) (*RCD, error) {
 		receiver:           receiver,
 		slotSource:         slotSource,
 		disclosureMessages: make(chan DisclosurePayload, 1024),
+		messageBuffer:      make([][]byte, 0),
+		mode:               cfg.Mode,
 	}, nil
 }
 
@@ -198,20 +214,28 @@ func (r *RCD) broadcastLoop() {
 	defer r.wg.Done()
 	// log.Printf("Starting broadcast loop")
 
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
+	trafficTicker := time.NewTicker(3 * time.Second)
+	defer trafficTicker.Stop()
+	slotTicker := r.slotSource.Ticker(r.ctx)
 
 	for {
 		select {
 		case <-r.ctx.Done():
 			// log.Printf("Broadcast loop stopping")
 			return
-		case <-ticker.C:
+		case <-trafficTicker.C:
 			msg := fmt.Sprintf("%s: mayday %d", r.id, r.messageCounter)
 			r.messageCounter++
 			if err := r.broadcast([]byte(msg)); err != nil {
 				// log.Printf("Failed to broadcast: %v", err)
 			}
+		case currentSlot := <-slotTicker:
+			go func(slotToFlush uint64) {
+				if err := r.flushBatch(slotToFlush); err != nil {
+					log.Printf("Failed to flush batch for slot %d: %v", slotToFlush, err)
+				}
+			}(currentSlot - 1)
+
 		}
 	}
 }
@@ -219,6 +243,9 @@ func (r *RCD) broadcastLoop() {
 // CurrentSlotKey returns the current slot and key for this slot.
 // The slot is as close as possible to the slot when the function returns.
 func (r *RCD) CurrentSlotKey() (slot.Slot, []byte, error) {
+	r.chainMutex.Lock()
+	defer r.chainMutex.Unlock()
+
 	for {
 		if r.hashChain == nil || r.cachedKeySlot == 0 {
 			log.Printf("No hashchain exists, requesting new one of length %d", r.hashchainLen)
@@ -274,6 +301,21 @@ func (r *RCD) CurrentSlotKey() (slot.Slot, []byte, error) {
 }
 
 func (r *RCD) broadcast(data []byte) error {
+	dataMsg := message.NewMessage(r.id, 0, message.MessageKindData, data)
+	msgBytes, _ := dataMsg.Marshal()
+	if err := r.broadcaster.Broadcast(r.ctx, msgBytes); err != nil {
+		return err
+	}
+
+	// Handle Authentication based on Mode
+	if r.mode == ModeDeterministic {
+		return r.broadcastDeterministic(data)
+	} else {
+		return r.bufferForBatch(data)
+	}
+}
+
+func (r *RCD) broadcastDeterministic(data []byte) error {
 	currentSlot, key, err := r.CurrentSlotKey()
 	if err != nil {
 		return fmt.Errorf("Failed to get current slot key: %v", err)
@@ -305,6 +347,70 @@ func (r *RCD) broadcast(data []byte) error {
 	default:
 		return fmt.Errorf("disclosure message queue is full")
 	}
+	return nil
+}
+
+func (r *RCD) bufferForBatch(data []byte) error {
+	r.bufferMutex.Lock()
+	defer r.bufferMutex.Unlock()
+	r.messageBuffer = append(r.messageBuffer, data)
+	return nil
+}
+
+func (r *RCD) flushBatch(slot uint64) error {
+	r.bufferMutex.Lock()
+	if len(r.messageBuffer) == 0 {
+		r.bufferMutex.Unlock()
+		return nil
+	}
+	messages := r.messageBuffer
+	count := len(messages)
+	r.messageBuffer = make([][]byte, 0) // Reset buffer
+	r.bufferMutex.Unlock()
+
+	
+	// 1. Create Bloom Filter
+	// Estimate n=len(messages), p=0.01 (1% false positive)
+	bf := bloom.New(uint(len(messages)), 0.01)
+	for _, msg := range messages {
+		bf.Add(msg)
+	}
+	bfData := bf.Bytes()
+
+	// 2. Sign the Bloom Filter (Standard TESLA MAC)
+	_, key, err := r.CurrentSlotKey()
+	if err != nil {
+		return err
+	}
+	
+	// MAC(Key, BloomFilter)
+	signature := r.calculateHMAC(key, bfData)
+	
+	// 3. Broadcast the HMAC of the Bloom Filter
+	// We reuse MessageKindHMAC, but the "Data" is now HMAC(BF)
+	hmacMsg := message.NewMessage(r.id, slot, message.MessageKindHMAC, signature)
+	hmacBytes, _ := hmacMsg.Marshal()
+	if err := r.broadcaster.Broadcast(r.ctx, hmacBytes); err != nil {
+		return err
+	}
+	
+	log.Printf("Sent HMAC message (Batch of %d messages) for slot %d", count, slot)
+	
+	// 4. Queue Disclosure
+	// CRITICAL: The disclosure must now allow the receiver to reconstruct the BF.
+	// You might need to send the BF itself here or in a separate message.
+	// For simplicity, let's assume we send the BF in the disclosure payload for now.
+
+	targetSlot := slot + r.disclosureDelay
+	keyArray := [32]byte{}
+	copy(keyArray[:], key)
+
+	r.disclosureMessages <- DisclosurePayload{
+		Message:    bfData, // storing BF as the "Message" to verify
+		Key:        keyArray,
+		TargetSlot: targetSlot,
+	}
+
 	return nil
 }
 

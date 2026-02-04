@@ -1,2 +1,4 @@
 /bin
 /internal/contract/contract.go
+*.pdf
+TODO.md

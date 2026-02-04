@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,6 +21,7 @@ func main() {
 	hashchainLen := flag.Int("hashchain-len", 1024, "Length of hashchains")
 	disclosureDelay := flag.Uint64("disclosure-delay", 2, "Disclosure delay for key revelation")
 	simulationTime := flag.Duration("simulation-time", 3*time.Minute, "Duration to run the simulation")
+	modeStr := flag.String("mode", "", "Operation mode: 'deterministic' or 'probabilistic'")
 
 	flag.Parse()
 
@@ -33,6 +35,18 @@ func main() {
 		log.Fatalf("Invalid UUID: %v", err)
 	}
 
+	var mode rcd.Mode
+	switch strings.ToLower(*modeStr) {
+	case "deterministic", "det", "":
+		mode = rcd.ModeDeterministic
+		log.Println("Starting RCD in DETERMINISTIC mode")
+	case "probabilistic", "prob":
+		mode = rcd.ModeProbabilistic
+		log.Println("Starting RCD in PROBABILISTIC mode")
+	default:
+		log.Fatalf("Unknown mode: %s", *modeStr)
+	}
+
 	cfg := rcd.Config{
 		UUID:            id,
 		OwnerAddr:       *ownerAddr,
@@ -41,6 +55,7 @@ func main() {
 		HashchainLen:    *hashchainLen,
 		DisclosureDelay: *disclosureDelay,
 		SimulationTime:  *simulationTime,
+		Mode:            mode,
 	}
 
 	r, err := rcd.New(cfg)
