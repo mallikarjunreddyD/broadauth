@@ -53,6 +53,9 @@ type RCD struct {
 	receivedHMACs      sync.Map
 	commitmentKeys     sync.Map // maps uuid.UUID to []byte
 
+	// Buffer for Probabilistic Mode Receiver: Map[Slot] -> List of Data Messages
+	unverifiedMsgs sync.Map
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -141,9 +144,10 @@ func (r *RCD) Start() error {
 		return fmt.Errorf("failed to start receiver: %v", err)
 	}
 
-	r.wg.Add(2)
+	r.wg.Add(3)
 	go r.broadcastLoop()
 	go r.disclosureWorker()
+	go r.cleanupWorker()
 
 	// log.Printf("RCD started successfully")
 	return nil
@@ -301,7 +305,13 @@ func (r *RCD) CurrentSlotKey() (slot.Slot, []byte, error) {
 }
 
 func (r *RCD) broadcast(data []byte) error {
-	dataMsg := message.NewMessage(r.id, 0, message.MessageKindData, data)
+	// FIX: Use currentSlot for Data Message so Receiver knows when it was sent
+	currentSlot, _, err := r.CurrentSlotKey()
+	if err != nil {
+		return err
+	}
+
+	dataMsg := message.NewMessage(r.id, currentSlot, message.MessageKindData, data)
 	msgBytes, _ := dataMsg.Marshal()
 	if err := r.broadcaster.Broadcast(r.ctx, msgBytes); err != nil {
 		return err
@@ -368,7 +378,6 @@ func (r *RCD) flushBatch(slot uint64) error {
 	r.messageBuffer = make([][]byte, 0) // Reset buffer
 	r.bufferMutex.Unlock()
 
-	
 	// 1. Create Bloom Filter
 	// Estimate n=len(messages), p=0.01 (1% false positive)
 	bf := bloom.New(uint(len(messages)), 0.01)
@@ -382,10 +391,10 @@ func (r *RCD) flushBatch(slot uint64) error {
 	if err != nil {
 		return err
 	}
-	
+
 	// MAC(Key, BloomFilter)
 	signature := r.calculateHMAC(key, bfData)
-	
+
 	// 3. Broadcast the HMAC of the Bloom Filter
 	// We reuse MessageKindHMAC, but the "Data" is now HMAC(BF)
 	hmacMsg := message.NewMessage(r.id, slot, message.MessageKindHMAC, signature)
@@ -393,14 +402,10 @@ func (r *RCD) flushBatch(slot uint64) error {
 	if err := r.broadcaster.Broadcast(r.ctx, hmacBytes); err != nil {
 		return err
 	}
-	
-	log.Printf("Sent HMAC message (Batch of %d messages) for slot %d", count, slot)
-	
-	// 4. Queue Disclosure
-	// CRITICAL: The disclosure must now allow the receiver to reconstruct the BF.
-	// You might need to send the BF itself here or in a separate message.
-	// For simplicity, let's assume we send the BF in the disclosure payload for now.
 
+	log.Printf("Sent HMAC message (Batch of %d messages) for slot %d", count, slot)
+
+	// 4. Queue Disclosure
 	targetSlot := slot + r.disclosureDelay
 	keyArray := [32]byte{}
 	copy(keyArray[:], key)
@@ -474,29 +479,82 @@ func (r *RCD) disclosureWorker() {
 	}
 }
 
+func (r *RCD) cleanupWorker() {
+	defer r.wg.Done()
+	// Run cleanup every 10 seconds (or roughly every few slots)
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-ticker.C:
+			currentSlot, err := r.slotSource.GetSlot()
+			if err != nil {
+				continue
+			}
+
+			// Retention Window: How long to keep data if we miss the key?
+			// Let's say we keep it for 2x the disclosure delay + some buffer (e.g., 20 slots)
+			retentionThreshold := r.disclosureDelay + 20
+
+			r.unverifiedMsgs.Range(func(key, value interface{}) bool {
+				msgSlot := key.(uint64)
+
+				// If the message slot is significantly in the past compared to current slot
+				if msgSlot+retentionThreshold < currentSlot {
+					// log.Printf("Cleaning up expired messages for slot %d", msgSlot)
+					r.unverifiedMsgs.Delete(key)
+				}
+				return true
+			})
+		}
+	}
+}
+
 func (r *RCD) handleMessage(data []byte) {
+	// log.Printf("DEBUG: Packet received! Length: %d", len(data))
 	receivedMessage := &message.Message{}
 	if err := receivedMessage.Unmarshal(data); err != nil {
 		log.Printf("Error unmarshalling message: %v", err)
 		return
 	}
 
-	// currentSlot, err := r.slotSource.GetSlot()
-	// if err != nil {
-	// 	log.Printf("Failed to get current slot: %v", err)
-	// 	return
-	// }
+	// Get current slot for security validation
+	currentSlot, err := r.slotSource.GetSlot()
+	if err != nil {
+		log.Printf("Failed to get current slot: %v", err)
+		return
+	}
 
-	// TODO: Enable slot age validation after testing
-	// if receivedMessage.Slot+r.disclosureDelay < currentSlot {
-	// 	log.Printf("Discarding message from old slot %d (current: %d)", receivedMessage.Slot, currentSlot)
-	// 	return
-	// }
+	// --- SECURITY CHECK (Inf-TESLA Condition) ---
+	// A packet P authenticated with K_i must arrive BEFORE K_i is disclosed.
+	// K_i is disclosed at slot i + d.
+	// Therefore, if CurrentSlot >= MsgSlot + DisclosureDelay, the key might already be revealed,
+	// violating the security condition.
+	if receivedMessage.Kind == message.MessageKindData {
+		securityCutoff := receivedMessage.Slot + r.disclosureDelay
+		if currentSlot >= securityCutoff {
+			log.Printf("[SECURITY] Dropped message for slot %d. Arrived at %d (Key disclosed at %d)",
+				receivedMessage.Slot, currentSlot, securityCutoff)
+			return
+		}
+	}
+
+	// 1. Store Raw Data Messages (for Probabilistic Verification later)
+	if receivedMessage.Kind == message.MessageKindData {
+		r.storeUnverifiedMessage(receivedMessage.Slot, receivedMessage.Data)
+		return
+	}
 
 	if receivedMessage.Kind == message.MessageKindKeyMessage {
 		key, payload := receivedMessage.Data[:32], receivedMessage.Data[32:]
-		log.Printf("Received key disclosure message from %s for slot %d with key %s", receivedMessage.SenderID, receivedMessage.Slot, hex.EncodeToString(key))
 
+		log.Printf("Received key disclosure message from %s for slot %d with key %s",
+			receivedMessage.SenderID, receivedMessage.Slot, hex.EncodeToString(key))
+		
+		// 2. Integrity Check: Verify HMAC(Key, Payload)
 		var hmacArray [32]byte
 		copy(hmacArray[:], r.calculateHMAC(key, payload))
 
@@ -505,16 +563,50 @@ func (r *RCD) handleMessage(data []byte) {
 			return
 		}
 
-		log.Printf("Verified HMAC for key disclosure from %s", receivedMessage.SenderID)
-
+		// 3. Authenticity Check: Verify Key against HashChain
 		log.Printf("Attempting to verify key from %s", receivedMessage.SenderID)
-		verified := r.verifyKey(receivedMessage.SenderID, key)
-		if verified {
-			log.Printf("Successfully verified message from %s: %s", receivedMessage.SenderID, string(payload))
-		} else {
+		if !r.verifyKey(receivedMessage.SenderID, key) {
 			log.Printf("Failed to verify key from %s", receivedMessage.SenderID)
+			return
 		}
+
+		// 4. Verification Successful!
+		if r.mode == ModeProbabilistic {
+			// Payload is a Bloom Filter
+			bf := bloom.FromBytes(payload)
+			if bf == nil {
+				log.Printf("Failed to parse Bloom Filter")
+				return
+			}
+
+			// The key disclosed at slot `i+d` authenticates messages from slot `i`.
+			// So, if we receive a key at slot `S` (receivedMessage.Slot), it corresponds to messages
+			// sent at `S - disclosureDelay`.
+			targetSlot := receivedMessage.Slot - r.disclosureDelay
+			msgs := r.getUnverifiedMessages(targetSlot)
+
+			verifiedCount := 0
+			for _, m := range msgs {
+				if bf.Check(m) {
+					// Message Authenticated!
+					log.Printf("[SUCCESS] Verified message via Bloom Filter: %s", string(m))
+					verifiedCount++
+				}
+			}
+			log.Printf("Probabilistic Batch Verification: %d messages authenticated for slot %d", verifiedCount, targetSlot)
+
+			// --- IMMEDIATE CLEANUP ---
+			// We have processed this slot. Data arriving later for this slot
+			// will fail the Security Check anyway, so we delete the buffer to free memory.
+			r.unverifiedMsgs.Delete(targetSlot)
+
+		} else {
+			// Deterministic Mode: Payload IS the message
+			log.Printf("[SUCCESS] Verified message from %s: %s", receivedMessage.SenderID, string(payload))
+		}
+
 	} else {
+		// MessageKindHMAC: Just store the HMAC
 		log.Printf("Received HMAC message from %s for slot %d", receivedMessage.SenderID, receivedMessage.Slot)
 		var hmacArray [32]byte
 		copy(hmacArray[:], receivedMessage.Data)
@@ -522,37 +614,52 @@ func (r *RCD) handleMessage(data []byte) {
 	}
 }
 
+func (r *RCD) storeUnverifiedMessage(slot uint64, data []byte) {
+	// Load existing list or create new
+	value, _ := r.unverifiedMsgs.LoadOrStore(slot, make([][]byte, 0))
+	msgs := value.([][]byte)
+	// Append
+	msgs = append(msgs, data)
+	// Store back
+	r.unverifiedMsgs.Store(slot, msgs)
+}
+
+func (r *RCD) getUnverifiedMessages(slot uint64) [][]byte {
+	value, ok := r.unverifiedMsgs.Load(slot)
+	if !ok {
+		return nil
+	}
+	return value.([][]byte)
+}
+
 func (r *RCD) verifyKey(senderID uuid.UUID, key []byte) bool {
 	commitmentKey, ok := r.commitmentKeys.Load(senderID)
 	if !ok {
-		log.Printf("No commitment key stored, fetching from contract for %s", senderID)
+		// log.Printf("No commitment key stored, fetching from contract for %s", senderID)
 
-		contractKey, startTime, endTime, delay, err := r.contract.GetKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
+		contractKey, _, _, _, err := r.contract.GetKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
 		if err != nil {
 			log.Printf("Failed to get key from contract: %v", err)
 			return false
 		}
-		log.Printf("Got key from contract - startTime: %d, endTime: %d, delay: %d",
-			startTime, endTime, delay)
 		if len(contractKey) == 0 {
 			log.Printf("Contract returned empty key")
 			return false
 		}
 		commitmentKey = []byte(contractKey)
 		r.commitmentKeys.Store(senderID, commitmentKey)
-		log.Printf("Stored commitment key of length %d for %s", len(commitmentKey.([]byte)), senderID)
+		// log.Printf("Stored commitment key for %s", senderID)
 	}
 
 	currentKey := make([]byte, 32)
 	copy(currentKey, key)
 
 	if len(currentKey) == len(commitmentKey.([]byte)) && hmac.Equal(currentKey, commitmentKey.([]byte)) {
-		log.Printf("Key matches commitment directly (0 hashes)")
 		r.commitmentKeys.Store(senderID, currentKey)
 		return true
 	}
 
-	log.Printf("Starting hash chain verification")
+	// log.Printf("Starting hash chain verification")
 	for i := range r.hashchainLen + 1 {
 		h := sha256.New()
 		h.Write(currentKey)

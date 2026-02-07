@@ -1,6 +1,7 @@
 package bloom
 
 import (
+	"encoding/binary"
 	"hash/fnv"
 	"math"
 )
@@ -42,7 +43,46 @@ func (f *Filter) Add(data []byte) {
 	}
 }
 
-// Bytes returns the serialized bitset
+// Check tests if data is in the Bloom Filter
+func (f *Filter) Check(data []byte) bool {
+	h := fnv.New64a()
+	h.Write(data)
+	hash1 := h.Sum64()
+	h.Write([]byte{1})
+	hash2 := h.Sum64()
+
+	for i := uint(0); i < f.k; i++ {
+		idx := (hash1 + uint64(i)*hash2) % uint64(f.m)
+		byteIdx := idx / 8
+		bitIdx := idx % 8
+		if f.bitset[byteIdx]&(1<<bitIdx) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// Bytes returns the serialized bitset with metadata (m and k)
 func (f *Filter) Bytes() []byte {
-	return f.bitset
+	buf := make([]byte, 8+len(f.bitset))
+	binary.BigEndian.PutUint32(buf[0:4], uint32(f.m))
+	binary.BigEndian.PutUint32(buf[4:8], uint32(f.k))
+	copy(buf[8:], f.bitset)
+	return buf
+}
+
+// FromBytes reconstructs a Bloom Filter from bytes
+func FromBytes(data []byte) *Filter {
+	if len(data) < 8 {
+		return nil
+	}
+	m := uint(binary.BigEndian.Uint32(data[0:4]))
+	k := uint(binary.BigEndian.Uint32(data[4:8]))
+	bitset := make([]byte, len(data)-8)
+	copy(bitset, data[8:])
+	return &Filter{
+		bitset: bitset,
+		k:      k,
+		m:      m,
+	}
 }
