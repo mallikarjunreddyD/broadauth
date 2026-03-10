@@ -1,2 +1,7 @@
-/bin
+/bin/
 /internal/contract/contract.go
+*.pdf
+/TODO.md
+/results/
+/plots/
+/logs/
