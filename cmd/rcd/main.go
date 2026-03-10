@@ -22,6 +22,9 @@ func main() {
 	disclosureDelay := flag.Uint64("disclosure-delay", 2, "Disclosure delay for key revelation")
 	simulationTime := flag.Duration("simulation-time", 3*time.Minute, "Duration to run the simulation")
 	modeStr := flag.String("mode", "", "Operation mode: 'deterministic' or 'probabilistic'")
+	
+	// NEW FLAG
+	bench := flag.Bool("bench", false, "Enable runtime benchmarking metrics")
 
 	flag.Parse()
 
@@ -48,14 +51,15 @@ func main() {
 	}
 
 	cfg := rcd.Config{
-		UUID:            id,
-		OwnerAddr:       *ownerAddr,
-		EthURL:          *ethURL,
-		ContractAddr:    *contractAddr,
-		HashchainLen:    *hashchainLen,
-		DisclosureDelay: *disclosureDelay,
-		SimulationTime:  *simulationTime,
-		Mode:            mode,
+		UUID:               id,
+		OwnerAddr:          *ownerAddr,
+		EthURL:             *ethURL,
+		ContractAddr:       *contractAddr,
+		HashchainLen:       *hashchainLen,
+		DisclosureDelay:    *disclosureDelay,
+		SimulationTime:     *simulationTime,
+		Mode:               mode,
+		EnableBenchmarking: *bench, // Pass the flag value
 	}
 
 	r, err := rcd.New(cfg)

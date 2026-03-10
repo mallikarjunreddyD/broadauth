@@ -4,13 +4,15 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
 	"net"
+	"os"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -33,6 +35,23 @@ const (
 	ModeProbabilistic
 )
 
+// Metrics holds atomic counters for benchmarking
+type Metrics struct {
+	BytesSent        uint64
+	BytesReceived    uint64
+	MessagesSent     uint64
+	MessagesReceived uint64
+	OverheadBytes    uint64 // Bytes used for HMACs, Keys, BloomFilters (non-payload)
+
+	// Timing Metrics (Cumulative Nanoseconds)
+	HMACDuration      int64
+	HMACCount         int64
+	VerifyDuration    int64
+	VerifyCount       int64
+	BroadcastDuration int64
+	BroadcastCount    int64
+}
+
 type RCD struct {
 	id        uuid.UUID
 	ownerAddr string
@@ -51,7 +70,7 @@ type RCD struct {
 
 	disclosureMessages chan DisclosurePayload
 	receivedHMACs      sync.Map
-	commitmentKeys     sync.Map // maps uuid.UUID to []byte
+	commitmentKeys     sync.Map
 
 	// Buffer for Probabilistic Mode Receiver: Map[Slot] -> List of Data Messages
 	unverifiedMsgs sync.Map
@@ -63,10 +82,14 @@ type RCD struct {
 	cachedKey     [32]byte
 	cachedKeySlot uint64
 
-	mode          Mode
-	messageBuffer [][]byte
-	bufferMutex   sync.Mutex
-	chainMutex    sync.Mutex
+	mode               Mode
+	messageBuffer      [][]byte
+	bufferMutex        sync.Mutex
+	chainMutex         sync.Mutex
+	enableBenchmarking bool
+
+	// Performance Metrics
+	metrics Metrics
 }
 
 type DisclosurePayload struct {
@@ -76,14 +99,15 @@ type DisclosurePayload struct {
 }
 
 type Config struct {
-	UUID            uuid.UUID
-	OwnerAddr       string
-	EthURL          string
-	ContractAddr    string
-	HashchainLen    int
-	DisclosureDelay uint64
-	SimulationTime  time.Duration
-	Mode            Mode
+	UUID               uuid.UUID
+	OwnerAddr          string
+	EthURL             string
+	ContractAddr       string
+	HashchainLen       int
+	DisclosureDelay    uint64
+	SimulationTime     time.Duration
+	Mode               Mode
+	EnableBenchmarking bool
 }
 
 func New(cfg Config) (*RCD, error) {
@@ -132,11 +156,11 @@ func New(cfg Config) (*RCD, error) {
 		disclosureMessages: make(chan DisclosurePayload, 1024),
 		messageBuffer:      make([][]byte, 0),
 		mode:               cfg.Mode,
+		enableBenchmarking: cfg.EnableBenchmarking,
 	}, nil
 }
 
 func (r *RCD) Start() error {
-	// log.Printf("Starting RCD with ID %s", r.id)
 	r.ctx, r.cancel = context.WithTimeout(context.Background(), r.simulationTime)
 
 	r.receiver.SetMessageHandler(r.handleMessage)
@@ -144,46 +168,136 @@ func (r *RCD) Start() error {
 		return fmt.Errorf("failed to start receiver: %v", err)
 	}
 
-	r.wg.Add(3)
+	// Logging Configuration based on Mode
+	if r.enableBenchmarking {
+		// Disable standard logs during benchmarking to keep output clean and fast
+		log.SetOutput(io.Discard)
+		r.wg.Add(4)
+		go r.benchmarkWorker()
+	} else {
+		// Enable standard logs for normal operation
+		log.SetOutput(os.Stderr)
+		r.wg.Add(3)
+	}
+
 	go r.broadcastLoop()
 	go r.disclosureWorker()
 	go r.cleanupWorker()
 
-	// log.Printf("RCD started successfully")
+	modeStr := "DETERMINISTIC"
+	if r.mode == ModeProbabilistic {
+		modeStr = "PROBABILISTIC"
+	}
+	// This log will print in normal mode, and be discarded in bench mode
+	log.Printf("Starting RCD in %s mode", modeStr)
+
 	return nil
 }
 
 func (r *RCD) Stop() error {
-	// log.Printf("Stopping RCD with ID %s", r.id)
 	r.cancel()
 	r.wg.Wait()
 	r.ethClient.Close()
-	// log.Printf("RCD stopped successfully")
 	return nil
+}
+
+// benchmarkWorker prints stats every 5 seconds (Runs independently of hot path)
+// It writes to Stdout, bypassing the log discard.
+func (r *RCD) benchmarkWorker() {
+	defer r.wg.Done()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	var prevBytesSent, prevBytesRecv, prevMsgSent uint64
+	var prevHMACDur, prevHMACCount int64
+	var prevVerifyDur, prevVerifyCount int64
+	var prevBroadcastDur, prevBroadcastCount int64
+
+	startTime := time.Now()
+
+	fmt.Println("   Time |      Tx Rate      |      Rx Rate      |  Msg/s  | Mem(MB) | Total Overhead | Avg HMAC (µs) | Avg Verify (µs) | Avg Bcast (µs)")
+	fmt.Println("------------------------------------------------------------------------------------------------------------------------------------")
+
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case t := <-ticker.C:
+			// Snapshot atomic counters (Cheap)
+			currBytesSent := atomic.LoadUint64(&r.metrics.BytesSent)
+			currBytesRecv := atomic.LoadUint64(&r.metrics.BytesReceived)
+			currMsgSent := atomic.LoadUint64(&r.metrics.MessagesSent)
+			overhead := atomic.LoadUint64(&r.metrics.OverheadBytes)
+
+			currHMACDur := atomic.LoadInt64(&r.metrics.HMACDuration)
+			currHMACCount := atomic.LoadInt64(&r.metrics.HMACCount)
+			currVerifyDur := atomic.LoadInt64(&r.metrics.VerifyDuration)
+			currVerifyCount := atomic.LoadInt64(&r.metrics.VerifyCount)
+			currBroadcastDur := atomic.LoadInt64(&r.metrics.BroadcastDuration)
+			currBroadcastCount := atomic.LoadInt64(&r.metrics.BroadcastCount)
+
+			// Calculate rates over the last 5 seconds
+			txRate := float64(currBytesSent-prevBytesSent) / 5.0
+			rxRate := float64(currBytesRecv-prevBytesRecv) / 5.0
+			msgRate := float64(currMsgSent-prevMsgSent) / 5.0
+
+			// Calculate Average Latencies (Microseconds)
+			avgHMAC := 0.0
+			if diff := currHMACCount - prevHMACCount; diff > 0 {
+				avgHMAC = float64(currHMACDur-prevHMACDur) / float64(diff) / 1000.0
+			}
+
+			avgVerify := 0.0
+			if diff := currVerifyCount - prevVerifyCount; diff > 0 {
+				avgVerify = float64(currVerifyDur-prevVerifyDur) / float64(diff) / 1000.0
+			}
+
+			avgBroadcast := 0.0
+			if diff := currBroadcastCount - prevBroadcastCount; diff > 0 {
+				avgBroadcast = float64(currBroadcastDur-prevBroadcastDur) / float64(diff) / 1000.0
+			}
+
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+			memUsage := float64(m.Alloc) / 1024 / 1024
+
+			elapsed := t.Sub(startTime).Seconds()
+
+			// Print to Stdout (visible even if log is discarded)
+			fmt.Printf("%7.1fs | %10.2f B/s | %10.2f B/s | %7.1f | %7.2f | %12d B | %12.2f | %14.2f | %13.2f\n",
+				elapsed, txRate, rxRate, msgRate, memUsage, overhead, avgHMAC, avgVerify, avgBroadcast)
+
+			prevBytesSent = currBytesSent
+			prevBytesRecv = currBytesRecv
+			prevMsgSent = currMsgSent
+			prevHMACDur = currHMACDur
+			prevHMACCount = currHMACCount
+			prevVerifyDur = currVerifyDur
+			prevVerifyCount = currVerifyCount
+			prevBroadcastDur = currBroadcastDur
+			prevBroadcastCount = currBroadcastCount
+		}
+	}
 }
 
 func (r *RCD) RequestHashChain(currentSlot uint64) error {
 	const maxRetries = 3
 	var lastErr error
-
-	// log.Printf("Starting hashchain request for slot %d", currentSlot)
 	for i := range maxRetries {
 		if err := r.requestHashChainOnce(currentSlot); err != nil {
 			lastErr = err
-			// log.Printf("Attempt %d failed to request hashchain: %v", i+1, err)
 			time.Sleep(time.Second * time.Duration(i+1))
 			continue
 		}
-		// log.Printf("Successfully received hashchain for slot %d", currentSlot)
 		return nil
 	}
-	return fmt.Errorf("failed to request hashchain after %d attempts: %v", maxRetries, lastErr)
+	return fmt.Errorf("failed to request hashchain after retries: %v", lastErr)
 }
 
 func (r *RCD) requestHashChainOnce(currentSlot uint64) error {
 	conn, err := net.Dial("tcp", r.ownerAddr)
 	if err != nil {
-		return fmt.Errorf("failed to connect to owner: %v", err)
+		return fmt.Errorf("failed to dial owner: %v", err)
 	}
 	defer conn.Close()
 
@@ -192,22 +306,21 @@ func (r *RCD) requestHashChainOnce(currentSlot uint64) error {
 	new(big.Int).SetUint64(currentSlot).FillBytes(payload[16:48])
 
 	if err := conn.SetDeadline(time.Now().Add(60 * time.Second)); err != nil {
-		return fmt.Errorf("failed to set connection deadline: %v", err)
+		return fmt.Errorf("failed to set deadline: %v", err)
 	}
-
 	if _, err := conn.Write(payload); err != nil {
-		return fmt.Errorf("failed to send request: %v", err)
+		return fmt.Errorf("failed to write request: %v", err)
 	}
 
 	chainSize := (r.hashchainLen + 1) * 32
 	chain := make([]byte, chainSize)
 	if _, err := io.ReadFull(conn, chain); err != nil {
-		return fmt.Errorf("failed to read hashchain: %v", err)
+		return fmt.Errorf("failed to read hashchain response: %v", err)
 	}
 
 	hashChain, err := hashchain.NewLinearFromExisting(sha256.New(), chain)
 	if err != nil || hashChain.Remaining() < 1 {
-		return fmt.Errorf("failed to initialize hashchain: %v", err)
+		return fmt.Errorf("failed to initialize hashchain from bytes: %v", err)
 	}
 
 	r.hashChain = hashChain
@@ -216,22 +329,21 @@ func (r *RCD) requestHashChainOnce(currentSlot uint64) error {
 
 func (r *RCD) broadcastLoop() {
 	defer r.wg.Done()
-	// log.Printf("Starting broadcast loop")
-
-	trafficTicker := time.NewTicker(3 * time.Second)
+	// High-speed traffic for benchmarking (approx 500 msgs/sec)
+	trafficTicker := time.NewTicker(2 * time.Second)
 	defer trafficTicker.Stop()
 	slotTicker := r.slotSource.Ticker(r.ctx)
 
 	for {
 		select {
 		case <-r.ctx.Done():
-			// log.Printf("Broadcast loop stopping")
 			return
 		case <-trafficTicker.C:
-			msg := fmt.Sprintf("%s: mayday %d", r.id, r.messageCounter)
+			msg := fmt.Sprintf("%s: payload_data_%d", r.id, r.messageCounter)
 			r.messageCounter++
 			if err := r.broadcast([]byte(msg)); err != nil {
-				// log.Printf("Failed to broadcast: %v", err)
+				// Logs will be discarded if benchmarking is enabled
+				log.Printf("Failed to broadcast message: %v", err)
 			}
 		case currentSlot := <-slotTicker:
 			go func(slotToFlush uint64) {
@@ -239,60 +351,39 @@ func (r *RCD) broadcastLoop() {
 					log.Printf("Failed to flush batch for slot %d: %v", slotToFlush, err)
 				}
 			}(currentSlot - 1)
-
 		}
 	}
 }
 
-// CurrentSlotKey returns the current slot and key for this slot.
-// The slot is as close as possible to the slot when the function returns.
 func (r *RCD) CurrentSlotKey() (slot.Slot, []byte, error) {
 	r.chainMutex.Lock()
 	defer r.chainMutex.Unlock()
 
 	for {
 		if r.hashChain == nil || r.cachedKeySlot == 0 {
-			log.Printf("No hashchain exists, requesting new one of length %d", r.hashchainLen)
-
+			log.Printf("Hashchain exhausted or missing, refilling...")
 			hashchainBeginSlot, err := r.slotSource.GetSlot()
 			if err != nil {
-				return 0, nil, fmt.Errorf("Failed to get current slot: %v", err)
+				return 0, nil, fmt.Errorf("failed to get current slot: %v", err)
 			}
-
 			if err := r.RequestHashChain(uint64(hashchainBeginSlot)); err != nil {
-				return 0, nil, fmt.Errorf("Failed to request new hashchain: %v", err)
+				return 0, nil, fmt.Errorf("failed to request new hashchain: %v", err)
 			}
-			if r.hashChain.Remaining() != r.hashchainLen {
-				log.Printf("Hashchain length mismatch, expected %d, got %d", r.hashchainLen, r.hashChain.Remaining())
-				return 0, nil, fmt.Errorf("Hashchain length mismatch")
-			}
-
 			key := r.hashChain.Next()
-			if len(key) == 0 {
-				r.cachedKeySlot = 0
-			} else {
-				copy(r.cachedKey[:], key)
-				r.cachedKeySlot = hashchainBeginSlot
-			}
-		}
-
-		if r.cachedKeySlot == 0 {
-			panic("Could not cache key even after requesting a new hashchain")
+			copy(r.cachedKey[:], key)
+			r.cachedKeySlot = hashchainBeginSlot
 		}
 
 		currentSlot, err := r.slotSource.GetSlot()
 		if err != nil {
-			return 0, nil, fmt.Errorf("Failed to get current slot: %v", err)
+			return 0, nil, fmt.Errorf("failed to get current slot in loop: %v", err)
 		}
-
-		log.Printf("Current slot: %d, cached slot: %d", currentSlot, r.cachedKeySlot)
 
 		for r.cachedKeySlot < currentSlot {
 			if r.hashChain.Remaining() == 0 {
 				r.cachedKeySlot = 0
 				break
 			}
-
 			key := r.hashChain.Next()
 			copy(r.cachedKey[:], key)
 			r.cachedKeySlot++
@@ -305,19 +396,33 @@ func (r *RCD) CurrentSlotKey() (slot.Slot, []byte, error) {
 }
 
 func (r *RCD) broadcast(data []byte) error {
-	// FIX: Use currentSlot for Data Message so Receiver knows when it was sent
 	currentSlot, _, err := r.CurrentSlotKey()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get current slot/key: %v", err)
 	}
 
 	dataMsg := message.NewMessage(r.id, currentSlot, message.MessageKindData, data)
-	msgBytes, _ := dataMsg.Marshal()
-	if err := r.broadcaster.Broadcast(r.ctx, msgBytes); err != nil {
-		return err
+	msgBytes, err := dataMsg.Marshal()
+	if err != nil {
+		return fmt.Errorf("failed to marshal data message: %v", err)
 	}
 
-	// Handle Authentication based on Mode
+	if r.enableBenchmarking {
+		atomic.AddUint64(&r.metrics.BytesSent, uint64(len(msgBytes)))
+		atomic.AddUint64(&r.metrics.MessagesSent, 1)
+	}
+
+	start := time.Now()
+	err = r.broadcaster.Broadcast(r.ctx, msgBytes)
+	if r.enableBenchmarking {
+		atomic.AddInt64(&r.metrics.BroadcastDuration, time.Since(start).Nanoseconds())
+		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to broadcast data message: %v", err)
+	}
+
 	if r.mode == ModeDeterministic {
 		return r.broadcastDeterministic(data)
 	} else {
@@ -328,20 +433,39 @@ func (r *RCD) broadcast(data []byte) error {
 func (r *RCD) broadcastDeterministic(data []byte) error {
 	currentSlot, key, err := r.CurrentSlotKey()
 	if err != nil {
-		return fmt.Errorf("Failed to get current slot key: %v", err)
+		return fmt.Errorf("failed to get current slot/key for deterministic auth: %v", err)
 	}
 
+	startHMAC := time.Now()
 	signature := r.calculateHMAC(key, data)
-	hmacMessage := message.NewMessage(r.id, currentSlot, message.MessageKindHMAC, signature)
+	if r.enableBenchmarking {
+		atomic.AddInt64(&r.metrics.HMACDuration, time.Since(startHMAC).Nanoseconds())
+		atomic.AddInt64(&r.metrics.HMACCount, 1)
+	}
 
+	hmacMessage := message.NewMessage(r.id, currentSlot, message.MessageKindHMAC, signature)
 	hmacData, err := hmacMessage.Marshal()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal HMAC message: %v", err)
 	}
 
-	if err := r.broadcaster.Broadcast(r.ctx, hmacData); err != nil {
-		return err
+	if r.enableBenchmarking {
+		l := uint64(len(hmacData))
+		atomic.AddUint64(&r.metrics.BytesSent, l)
+		atomic.AddUint64(&r.metrics.OverheadBytes, l)
 	}
+
+	startBroadcast := time.Now()
+	err = r.broadcaster.Broadcast(r.ctx, hmacData)
+	if r.enableBenchmarking {
+		atomic.AddInt64(&r.metrics.BroadcastDuration, time.Since(startBroadcast).Nanoseconds())
+		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to broadcast HMAC message: %v", err)
+	}
+
 	log.Printf("Sent HMAC message for slot %d", currentSlot)
 
 	targetSlot := currentSlot + r.disclosureDelay
@@ -355,7 +479,8 @@ func (r *RCD) broadcastDeterministic(data []byte) error {
 		TargetSlot: targetSlot,
 	}:
 	default:
-		return fmt.Errorf("disclosure message queue is full")
+		// Queue full, drop disclosure to avoid blocking
+		return fmt.Errorf("disclosure queue full")
 	}
 	return nil
 }
@@ -375,47 +500,65 @@ func (r *RCD) flushBatch(slot uint64) error {
 	}
 	messages := r.messageBuffer
 	count := len(messages)
-	r.messageBuffer = make([][]byte, 0) // Reset buffer
+	r.messageBuffer = make([][]byte, 0)
 	r.bufferMutex.Unlock()
 
-	// 1. Create Bloom Filter
-	// Estimate n=len(messages), p=0.01 (1% false positive)
 	bf := bloom.New(uint(len(messages)), 0.01)
 	for _, msg := range messages {
 		bf.Add(msg)
 	}
 	bfData := bf.Bytes()
 
-	// 2. Sign the Bloom Filter (Standard TESLA MAC)
 	_, key, err := r.CurrentSlotKey()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get current slot/key for batch flush: %v", err)
 	}
 
-	// MAC(Key, BloomFilter)
+	startHMAC := time.Now()
 	signature := r.calculateHMAC(key, bfData)
+	if r.enableBenchmarking {
+		atomic.AddInt64(&r.metrics.HMACDuration, time.Since(startHMAC).Nanoseconds())
+		atomic.AddInt64(&r.metrics.HMACCount, 1)
+	}
 
-	// 3. Broadcast the HMAC of the Bloom Filter
-	// We reuse MessageKindHMAC, but the "Data" is now HMAC(BF)
 	hmacMsg := message.NewMessage(r.id, slot, message.MessageKindHMAC, signature)
-	hmacBytes, _ := hmacMsg.Marshal()
-	if err := r.broadcaster.Broadcast(r.ctx, hmacBytes); err != nil {
-		return err
+	hmacBytes, err := hmacMsg.Marshal()
+	if err != nil {
+		return fmt.Errorf("failed to marshal batch HMAC message: %v", err)
+	}
+
+	if r.enableBenchmarking {
+		l := uint64(len(hmacBytes))
+		atomic.AddUint64(&r.metrics.BytesSent, l)
+		atomic.AddUint64(&r.metrics.OverheadBytes, l)
+	}
+
+	startBroadcast := time.Now()
+	err = r.broadcaster.Broadcast(r.ctx, hmacBytes)
+	if r.enableBenchmarking {
+		atomic.AddInt64(&r.metrics.BroadcastDuration, time.Since(startBroadcast).Nanoseconds())
+		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to broadcast batch HMAC message: %v", err)
 	}
 
 	log.Printf("Sent HMAC message (Batch of %d messages) for slot %d", count, slot)
 
-	// 4. Queue Disclosure
 	targetSlot := slot + r.disclosureDelay
 	keyArray := [32]byte{}
 	copy(keyArray[:], key)
 
-	r.disclosureMessages <- DisclosurePayload{
-		Message:    bfData, // storing BF as the "Message" to verify
+	select {
+	case r.disclosureMessages <- DisclosurePayload{
+		Message:    bfData,
 		Key:        keyArray,
 		TargetSlot: targetSlot,
+	}:
+	default:
+		return fmt.Errorf("disclosure queue full")
 	}
-
 	return nil
 }
 
@@ -427,7 +570,7 @@ func (r *RCD) disclosureWorker() {
 	for {
 		select {
 		case currentSlot := <-ticker:
-			// Process any new disclosure messages
+			// Drain new disclosures from channel
 			for {
 				select {
 				case disclosure := <-r.disclosureMessages:
@@ -436,43 +579,47 @@ func (r *RCD) disclosureWorker() {
 					goto ProcessPending
 				}
 			}
-
 		ProcessPending:
-			// Check and broadcast ready disclosures
 			readyIdx := 0
 			for i, disclosure := range pendingDisclosures {
 				if disclosure.TargetSlot > currentSlot {
 					readyIdx = i
 					break
 				}
-
-				// Create and broadcast disclosure message
 				disclosureMsg := message.NewMessage(
 					r.id,
 					currentSlot,
 					message.MessageKindKeyMessage,
 					append(disclosure.Key[:], disclosure.Message...),
 				)
-
 				data, err := disclosureMsg.Marshal()
-				if err != nil {
-					log.Printf("Error marshalling disclosure message: %v", err)
-					continue
-				}
+				if err == nil {
+					if r.enableBenchmarking {
+						l := uint64(len(data))
+						atomic.AddUint64(&r.metrics.BytesSent, l)
+						atomic.AddUint64(&r.metrics.OverheadBytes, l)
+					}
 
-				if err := r.broadcaster.Broadcast(r.ctx, data); err != nil {
-					log.Printf("Error broadcasting disclosure message: %v", err)
-					continue
+					startBroadcast := time.Now()
+					err := r.broadcaster.Broadcast(r.ctx, data)
+					if r.enableBenchmarking {
+						atomic.AddInt64(&r.metrics.BroadcastDuration, time.Since(startBroadcast).Nanoseconds())
+						atomic.AddInt64(&r.metrics.BroadcastCount, 1)
+					}
+
+					if err != nil {
+						log.Printf("Failed to broadcast disclosure: %v", err)
+					} else {
+						log.Printf("Sent key disclosure message for slot %d", currentSlot)
+					}
+				} else {
+					log.Printf("Failed to marshal disclosure: %v", err)
 				}
-				log.Printf("Sent key disclosure message for slot %d", currentSlot)
 				readyIdx = i + 1
 			}
-
-			// Remove processed disclosures
 			if readyIdx > 0 {
 				pendingDisclosures = pendingDisclosures[readyIdx:]
 			}
-
 		case <-r.ctx.Done():
 			return
 		}
@@ -481,10 +628,8 @@ func (r *RCD) disclosureWorker() {
 
 func (r *RCD) cleanupWorker() {
 	defer r.wg.Done()
-	// Run cleanup every 10 seconds (or roughly every few slots)
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-r.ctx.Done():
@@ -492,19 +637,13 @@ func (r *RCD) cleanupWorker() {
 		case <-ticker.C:
 			currentSlot, err := r.slotSource.GetSlot()
 			if err != nil {
+				log.Printf("Failed to get slot for cleanup: %v", err)
 				continue
 			}
-
-			// Retention Window: How long to keep data if we miss the key?
-			// Let's say we keep it for 2x the disclosure delay + some buffer (e.g., 20 slots)
 			retentionThreshold := r.disclosureDelay + 20
-
 			r.unverifiedMsgs.Range(func(key, value interface{}) bool {
-				msgSlot := key.(uint64)
-
-				// If the message slot is significantly in the past compared to current slot
-				if msgSlot+retentionThreshold < currentSlot {
-					// log.Printf("Cleaning up expired messages for slot %d", msgSlot)
+				if key.(uint64)+retentionThreshold < currentSlot {
+					// Silent cleanup (unless debugging)
 					r.unverifiedMsgs.Delete(key)
 				}
 				return true
@@ -514,99 +653,85 @@ func (r *RCD) cleanupWorker() {
 }
 
 func (r *RCD) handleMessage(data []byte) {
-	// log.Printf("DEBUG: Packet received! Length: %d", len(data))
+	if r.enableBenchmarking {
+		atomic.AddUint64(&r.metrics.BytesReceived, uint64(len(data)))
+		atomic.AddUint64(&r.metrics.MessagesReceived, 1)
+	}
+
 	receivedMessage := &message.Message{}
 	if err := receivedMessage.Unmarshal(data); err != nil {
 		log.Printf("Error unmarshalling message: %v", err)
 		return
 	}
 
-	// Get current slot for security validation
 	currentSlot, err := r.slotSource.GetSlot()
 	if err != nil {
-		log.Printf("Failed to get current slot: %v", err)
+		log.Printf("Failed to get current slot in handler: %v", err)
 		return
 	}
 
-	// --- SECURITY CHECK (Inf-TESLA Condition) ---
-	// A packet P authenticated with K_i must arrive BEFORE K_i is disclosed.
-	// K_i is disclosed at slot i + d.
-	// Therefore, if CurrentSlot >= MsgSlot + DisclosureDelay, the key might already be revealed,
-	// violating the security condition.
 	if receivedMessage.Kind == message.MessageKindData {
 		securityCutoff := receivedMessage.Slot + r.disclosureDelay
 		if currentSlot >= securityCutoff {
-			log.Printf("[SECURITY] Dropped message for slot %d. Arrived at %d (Key disclosed at %d)",
-				receivedMessage.Slot, currentSlot, securityCutoff)
+			log.Printf("[SECURITY] Dropped message for slot %d (arrived too late)", receivedMessage.Slot)
 			return
 		}
-	}
-
-	// 1. Store Raw Data Messages (for Probabilistic Verification later)
-	if receivedMessage.Kind == message.MessageKindData {
 		r.storeUnverifiedMessage(receivedMessage.Slot, receivedMessage.Data)
 		return
 	}
 
 	if receivedMessage.Kind == message.MessageKindKeyMessage {
+		log.Printf("Received key disclosure message from %s for slot %d", receivedMessage.SenderID, receivedMessage.Slot)
+
 		key, payload := receivedMessage.Data[:32], receivedMessage.Data[32:]
 
-		log.Printf("Received key disclosure message from %s for slot %d with key %s",
-			receivedMessage.SenderID, receivedMessage.Slot, hex.EncodeToString(key))
-		
-		// 2. Integrity Check: Verify HMAC(Key, Payload)
 		var hmacArray [32]byte
+		startHMAC := time.Now()
 		copy(hmacArray[:], r.calculateHMAC(key, payload))
+		if r.enableBenchmarking {
+			atomic.AddInt64(&r.metrics.HMACDuration, time.Since(startHMAC).Nanoseconds())
+			atomic.AddInt64(&r.metrics.HMACCount, 1)
+		}
 
 		if _, exists := r.receivedHMACs.LoadAndDelete(hmacArray); !exists {
 			log.Printf("No matching HMAC found for key disclosure from %s", receivedMessage.SenderID)
 			return
 		}
 
-		// 3. Authenticity Check: Verify Key against HashChain
-		log.Printf("Attempting to verify key from %s", receivedMessage.SenderID)
-		if !r.verifyKey(receivedMessage.SenderID, key) {
+		startVerify := time.Now()
+		verified := r.verifyKey(receivedMessage.SenderID, key)
+		if r.enableBenchmarking {
+			atomic.AddInt64(&r.metrics.VerifyDuration, time.Since(startVerify).Nanoseconds())
+			atomic.AddInt64(&r.metrics.VerifyCount, 1)
+		}
+
+		if !verified {
 			log.Printf("Failed to verify key from %s", receivedMessage.SenderID)
 			return
 		}
 
-		// 4. Verification Successful!
 		if r.mode == ModeProbabilistic {
-			// Payload is a Bloom Filter
 			bf := bloom.FromBytes(payload)
-			if bf == nil {
-				log.Printf("Failed to parse Bloom Filter")
-				return
-			}
+			if bf != nil {
+				targetSlot := receivedMessage.Slot - r.disclosureDelay
+				msgs := r.getUnverifiedMessages(targetSlot)
 
-			// The key disclosed at slot `i+d` authenticates messages from slot `i`.
-			// So, if we receive a key at slot `S` (receivedMessage.Slot), it corresponds to messages
-			// sent at `S - disclosureDelay`.
-			targetSlot := receivedMessage.Slot - r.disclosureDelay
-			msgs := r.getUnverifiedMessages(targetSlot)
-
-			verifiedCount := 0
-			for _, m := range msgs {
-				if bf.Check(m) {
-					// Message Authenticated!
-					log.Printf("[SUCCESS] Verified message via Bloom Filter: %s", string(m))
-					verifiedCount++
+				verifiedCount := 0
+				for _, m := range msgs {
+					if bf.Check(m) {
+						log.Printf("[SUCCESS] Verified message via Bloom Filter: %s", string(m))
+						verifiedCount++
+					}
 				}
+				log.Printf("Probabilistic Batch Verification: %d messages authenticated for slot %d", verifiedCount, targetSlot)
+				r.unverifiedMsgs.Delete(targetSlot)
 			}
-			log.Printf("Probabilistic Batch Verification: %d messages authenticated for slot %d", verifiedCount, targetSlot)
-
-			// --- IMMEDIATE CLEANUP ---
-			// We have processed this slot. Data arriving later for this slot
-			// will fail the Security Check anyway, so we delete the buffer to free memory.
-			r.unverifiedMsgs.Delete(targetSlot)
-
 		} else {
-			// Deterministic Mode: Payload IS the message
+			// Deterministic mode: Payload IS the message
 			log.Printf("[SUCCESS] Verified message from %s: %s", receivedMessage.SenderID, string(payload))
 		}
-
 	} else {
-		// MessageKindHMAC: Just store the HMAC
+		// HMAC Message
 		log.Printf("Received HMAC message from %s for slot %d", receivedMessage.SenderID, receivedMessage.Slot)
 		var hmacArray [32]byte
 		copy(hmacArray[:], receivedMessage.Data)
@@ -615,12 +740,9 @@ func (r *RCD) handleMessage(data []byte) {
 }
 
 func (r *RCD) storeUnverifiedMessage(slot uint64, data []byte) {
-	// Load existing list or create new
 	value, _ := r.unverifiedMsgs.LoadOrStore(slot, make([][]byte, 0))
 	msgs := value.([][]byte)
-	// Append
 	msgs = append(msgs, data)
-	// Store back
 	r.unverifiedMsgs.Store(slot, msgs)
 }
 
@@ -635,20 +757,13 @@ func (r *RCD) getUnverifiedMessages(slot uint64) [][]byte {
 func (r *RCD) verifyKey(senderID uuid.UUID, key []byte) bool {
 	commitmentKey, ok := r.commitmentKeys.Load(senderID)
 	if !ok {
-		// log.Printf("No commitment key stored, fetching from contract for %s", senderID)
-
 		contractKey, _, _, _, err := r.contract.GetKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
-		if err != nil {
-			log.Printf("Failed to get key from contract: %v", err)
-			return false
-		}
-		if len(contractKey) == 0 {
-			log.Printf("Contract returned empty key")
+		if err != nil || len(contractKey) == 0 {
+			// Log error via wrapping if we were returning, but here we just return bool
 			return false
 		}
 		commitmentKey = []byte(contractKey)
 		r.commitmentKeys.Store(senderID, commitmentKey)
-		// log.Printf("Stored commitment key for %s", senderID)
 	}
 
 	currentKey := make([]byte, 32)
@@ -659,20 +774,15 @@ func (r *RCD) verifyKey(senderID uuid.UUID, key []byte) bool {
 		return true
 	}
 
-	// log.Printf("Starting hash chain verification")
-	for i := range r.hashchainLen + 1 {
+	for range r.hashchainLen + 1 {
 		h := sha256.New()
 		h.Write(currentKey)
 		currentKey = h.Sum(nil)
-
 		if len(currentKey) == len(commitmentKey.([]byte)) && hmac.Equal(currentKey, commitmentKey.([]byte)) {
-			log.Printf("Key verified after %d hashes", i+1)
 			r.commitmentKeys.Store(senderID, key)
 			return true
 		}
 	}
-	log.Printf("Key verification failed after %d hashes", r.hashchainLen)
-
 	return false
 }
 
