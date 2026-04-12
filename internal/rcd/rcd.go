@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -33,6 +34,8 @@ type Mode int
 const (
 	ModeDeterministic Mode = iota
 	ModeProbabilistic
+	ModeAdaptive
+	ModeProbAdaptive
 )
 
 // Metrics holds atomic counters for benchmarking
@@ -62,6 +65,7 @@ type RCD struct {
 	hashchainLen    int
 	disclosureDelay uint64
 	simulationTime  time.Duration
+	startTime       time.Time
 	messageCounter  uint64
 
 	broadcaster broadcast.Broadcaster
@@ -72,7 +76,7 @@ type RCD struct {
 	receivedHMACs      sync.Map
 	commitmentKeys     sync.Map
 
-	// Buffer for Probabilistic Mode Receiver: Map[Slot] -> List of Data Messages
+	// Buffer for Probabilistic/Hybrid Mode Receiver: Map[Slot] -> List of Data Messages
 	unverifiedMsgs sync.Map
 
 	ctx    context.Context
@@ -87,6 +91,9 @@ type RCD struct {
 	bufferMutex        sync.Mutex
 	chainMutex         sync.Mutex
 	enableBenchmarking bool
+
+	adaptiveT      uint64
+	adaptiveOffset uint64
 
 	// Performance Metrics
 	metrics Metrics
@@ -108,6 +115,14 @@ type Config struct {
 	SimulationTime     time.Duration
 	Mode               Mode
 	EnableBenchmarking bool
+	TMin               uint64
+	TMax               uint64
+}
+
+type Schedule struct {
+	Index    uint64
+	Duration uint64
+	Offset   uint64
 }
 
 func New(cfg Config) (*RCD, error) {
@@ -137,9 +152,15 @@ func New(cfg Config) (*RCD, error) {
 		return nil, fmt.Errorf("invalid hashchain length: must be between 1 and %d", 10*1024)
 	}
 
-	slotSource, err := slot.NewBeaconChainSlotSource(client, 3*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create slot source: %v", err)
+	var slotSource slot.SlotSource
+
+	if cfg.Mode == ModeAdaptive || cfg.Mode == ModeProbAdaptive {
+		slotSource = slot.NewAdaptiveSlotSource(cfg.TMin)
+	} else {
+		slotSource, err = slot.NewBeaconChainSlotSource(client, 3*time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create slot source: %v", err)
+		}
 	}
 
 	return &RCD{
@@ -168,14 +189,13 @@ func (r *RCD) Start() error {
 		return fmt.Errorf("failed to start receiver: %v", err)
 	}
 
-	// Logging Configuration based on Mode
+	r.startTime = time.Now()
+
 	if r.enableBenchmarking {
-		// Disable standard logs during benchmarking to keep output clean and fast
 		log.SetOutput(io.Discard)
 		r.wg.Add(4)
 		go r.benchmarkWorker()
 	} else {
-		// Enable standard logs for normal operation
 		log.SetOutput(os.Stderr)
 		r.wg.Add(3)
 	}
@@ -187,8 +207,12 @@ func (r *RCD) Start() error {
 	modeStr := "DETERMINISTIC"
 	if r.mode == ModeProbabilistic {
 		modeStr = "PROBABILISTIC"
+	} else if r.mode == ModeAdaptive {
+		modeStr = "ADAPTIVE"
+	} else if r.mode == ModeProbAdaptive {
+		modeStr = "PROB-ADAPTIVE"
 	}
-	// This log will print in normal mode, and be discarded in bench mode
+
 	log.Printf("Starting RCD in %s mode", modeStr)
 
 	return nil
@@ -201,8 +225,6 @@ func (r *RCD) Stop() error {
 	return nil
 }
 
-// benchmarkWorker prints stats every 5 seconds (Runs independently of hot path)
-// It writes to Stdout, bypassing the log discard.
 func (r *RCD) benchmarkWorker() {
 	defer r.wg.Done()
 	ticker := time.NewTicker(5 * time.Second)
@@ -223,7 +245,6 @@ func (r *RCD) benchmarkWorker() {
 		case <-r.ctx.Done():
 			return
 		case t := <-ticker.C:
-			// Snapshot atomic counters (Cheap)
 			currBytesSent := atomic.LoadUint64(&r.metrics.BytesSent)
 			currBytesRecv := atomic.LoadUint64(&r.metrics.BytesReceived)
 			currMsgSent := atomic.LoadUint64(&r.metrics.MessagesSent)
@@ -236,12 +257,10 @@ func (r *RCD) benchmarkWorker() {
 			currBroadcastDur := atomic.LoadInt64(&r.metrics.BroadcastDuration)
 			currBroadcastCount := atomic.LoadInt64(&r.metrics.BroadcastCount)
 
-			// Calculate rates over the last 5 seconds
 			txRate := float64(currBytesSent-prevBytesSent) / 5.0
 			rxRate := float64(currBytesRecv-prevBytesRecv) / 5.0
 			msgRate := float64(currMsgSent-prevMsgSent) / 5.0
 
-			// Calculate Average Latencies (Microseconds)
 			avgHMAC := 0.0
 			if diff := currHMACCount - prevHMACCount; diff > 0 {
 				avgHMAC = float64(currHMACDur-prevHMACDur) / float64(diff) / 1000.0
@@ -263,7 +282,6 @@ func (r *RCD) benchmarkWorker() {
 
 			elapsed := t.Sub(startTime).Seconds()
 
-			// Print to Stdout (visible even if log is discarded)
 			fmt.Printf("%7.1fs | %10.2f B/s | %10.2f B/s | %7.1f | %7.2f | %12d B | %12.2f | %14.2f | %13.2f\n",
 				elapsed, txRate, rxRate, msgRate, memUsage, overhead, avgHMAC, avgVerify, avgBroadcast)
 
@@ -329,7 +347,6 @@ func (r *RCD) requestHashChainOnce(currentSlot uint64) error {
 
 func (r *RCD) broadcastLoop() {
 	defer r.wg.Done()
-	// High-speed traffic for benchmarking (approx 500 msgs/sec)
 	trafficTicker := time.NewTicker(2 * time.Second)
 	defer trafficTicker.Stop()
 	slotTicker := r.slotSource.Ticker(r.ctx)
@@ -342,13 +359,19 @@ func (r *RCD) broadcastLoop() {
 			msg := fmt.Sprintf("%s: payload_data_%d", r.id, r.messageCounter)
 			r.messageCounter++
 			if err := r.broadcast([]byte(msg)); err != nil {
-				// Logs will be discarded if benchmarking is enabled
 				log.Printf("Failed to broadcast message: %v", err)
 			}
 		case currentSlot := <-slotTicker:
 			go func(slotToFlush uint64) {
-				if err := r.flushBatch(slotToFlush); err != nil {
-					log.Printf("Failed to flush batch for slot %d: %v", slotToFlush, err)
+				switch r.mode {
+				case ModeProbAdaptive:
+					if err := r.flushAdaptiveBatch(slotToFlush); err != nil {
+						log.Printf("Failed to flush adaptive batch for slot %d: %v", slotToFlush, err)
+					}
+				case ModeProbabilistic:
+					if err := r.flushBatch(slotToFlush); err != nil {
+						log.Printf("Failed to flush batch for slot %d: %v", slotToFlush, err)
+					}
 				}
 			}(currentSlot - 1)
 		}
@@ -396,12 +419,35 @@ func (r *RCD) CurrentSlotKey() (slot.Slot, []byte, error) {
 }
 
 func (r *RCD) broadcast(data []byte) error {
-	currentSlot, _, err := r.CurrentSlotKey()
+	currentSlot, key, err := r.CurrentSlotKey()
 	if err != nil {
 		return fmt.Errorf("failed to get current slot/key: %v", err)
 	}
 
-	dataMsg := message.NewMessage(r.id, currentSlot, message.MessageKindData, data)
+	var payloadToBroadcast []byte
+	var sched Schedule
+
+	// 1. Pack data with schedule if in ANY adaptive mode
+	if r.mode == ModeAdaptive || r.mode == ModeProbAdaptive {
+		r.bufferMutex.Lock()
+		if r.adaptiveT == 0 {
+			r.adaptiveT = 3000 // Default T_i
+		}
+		sched = Schedule{
+			Index:    currentSlot,
+			Duration: r.adaptiveT,
+			Offset:   r.adaptiveOffset,
+		}
+		r.adaptiveOffset += r.adaptiveT
+		r.bufferMutex.Unlock()
+
+		payloadToBroadcast = packAdaptiveData(sched, data)
+	} else {
+		payloadToBroadcast = data
+	}
+
+	// 2. Broadcast the Data Message (Safely containing the Schedule if Adaptive)
+	dataMsg := message.NewMessage(r.id, currentSlot, message.MessageKindData, payloadToBroadcast)
 	msgBytes, err := dataMsg.Marshal()
 	if err != nil {
 		return fmt.Errorf("failed to marshal data message: %v", err)
@@ -423,19 +469,22 @@ func (r *RCD) broadcast(data []byte) error {
 		return fmt.Errorf("failed to broadcast data message: %v", err)
 	}
 
-	if r.mode == ModeDeterministic {
-		return r.broadcastDeterministic(data)
-	} else {
-		return r.bufferForBatch(data)
+	// 3. Route to the correct Cryptographic mechanism
+	switch r.mode {
+	case ModeDeterministic:
+		return r.broadcastDeterministic(data, key, currentSlot)
+	case ModeProbabilistic:
+		return r.broadcastProbabilistic(data)
+	case ModeAdaptive:
+		return r.broadcastAdaptive(payloadToBroadcast, key, currentSlot, sched)
+	case ModeProbAdaptive:
+		return r.broadcastProbadaptive(data) // Buffer raw data for BF
+	default:
+		return fmt.Errorf("unknown mode")
 	}
 }
 
-func (r *RCD) broadcastDeterministic(data []byte) error {
-	currentSlot, key, err := r.CurrentSlotKey()
-	if err != nil {
-		return fmt.Errorf("failed to get current slot/key for deterministic auth: %v", err)
-	}
-
+func (r *RCD) broadcastDeterministic(data []byte, key []byte, currentSlot uint64) error {
 	startHMAC := time.Now()
 	signature := r.calculateHMAC(key, data)
 	if r.enableBenchmarking {
@@ -479,16 +528,71 @@ func (r *RCD) broadcastDeterministic(data []byte) error {
 		TargetSlot: targetSlot,
 	}:
 	default:
-		// Queue full, drop disclosure to avoid blocking
 		return fmt.Errorf("disclosure queue full")
 	}
 	return nil
 }
 
-func (r *RCD) bufferForBatch(data []byte) error {
+func (r *RCD) broadcastProbabilistic(data []byte) error {
 	r.bufferMutex.Lock()
 	defer r.bufferMutex.Unlock()
 	r.messageBuffer = append(r.messageBuffer, data)
+	return nil
+}
+
+func (r *RCD) broadcastProbadaptive(data []byte) error {
+	r.bufferMutex.Lock()
+	defer r.bufferMutex.Unlock()
+	r.messageBuffer = append(r.messageBuffer, data)
+	return nil
+}
+
+func (r *RCD) broadcastAdaptive(packedData []byte, key []byte, currentSlot uint64, sched Schedule) error {
+	startHMAC := time.Now()
+	signature := r.calculateHMAC(key, packedData)
+	if r.enableBenchmarking {
+		atomic.AddInt64(&r.metrics.HMACDuration, time.Since(startHMAC).Nanoseconds())
+		atomic.AddInt64(&r.metrics.HMACCount, 1)
+	}
+
+	hmacMessage := message.NewMessage(r.id, currentSlot, message.MessageKindHMAC, signature)
+	hmacData, err := hmacMessage.Marshal()
+	if err != nil {
+		return fmt.Errorf("failed to marshal adaptive HMAC message: %v", err)
+	}
+
+	if r.enableBenchmarking {
+		l := uint64(len(hmacData))
+		atomic.AddUint64(&r.metrics.BytesSent, l)
+		atomic.AddUint64(&r.metrics.OverheadBytes, l)
+	}
+
+	startBroadcast := time.Now()
+	err = r.broadcaster.Broadcast(r.ctx, hmacData)
+	if r.enableBenchmarking {
+		atomic.AddInt64(&r.metrics.BroadcastDuration, time.Since(startBroadcast).Nanoseconds())
+		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to broadcast adaptive HMAC message: %v", err)
+	}
+
+	log.Printf("Sent Adaptive HMAC message for slot %d (T_i: %dms)", currentSlot, sched.Duration)
+
+	targetSlot := currentSlot + r.disclosureDelay
+	keyArray := [32]byte{}
+	copy(keyArray[:], key)
+
+	select {
+	case r.disclosureMessages <- DisclosurePayload{
+		Message:    packedData,
+		Key:        keyArray,
+		TargetSlot: targetSlot,
+	}:
+	default:
+		return fmt.Errorf("disclosure queue full")
+	}
 	return nil
 }
 
@@ -562,6 +666,82 @@ func (r *RCD) flushBatch(slot uint64) error {
 	return nil
 }
 
+func (r *RCD) flushAdaptiveBatch(slot uint64) error {
+	r.bufferMutex.Lock()
+	if len(r.messageBuffer) == 0 {
+		r.bufferMutex.Unlock()
+		return nil
+	}
+	messages := r.messageBuffer
+	count := len(messages)
+	r.messageBuffer = make([][]byte, 0)
+
+	if r.adaptiveT == 0 {
+		r.adaptiveT = 3000
+	}
+	sched := Schedule{
+		Index:    slot,
+		Duration: r.adaptiveT,
+		Offset:   r.adaptiveOffset,
+	}
+	r.adaptiveOffset += r.adaptiveT
+	r.bufferMutex.Unlock()
+
+	bf := bloom.New(uint(len(messages)), 0.01)
+	for _, msg := range messages {
+		bf.Add(msg)
+	}
+	bfData := bf.Bytes()
+
+	packedData := packAdaptiveData(sched, bfData)
+
+	_, key, err := r.CurrentSlotKey()
+	if err != nil {
+		return fmt.Errorf("failed to get current slot/key for adaptive batch flush: %v", err)
+	}
+
+	startHMAC := time.Now()
+	signature := r.calculateHMAC(key, packedData)
+	if r.enableBenchmarking {
+		atomic.AddInt64(&r.metrics.HMACDuration, time.Since(startHMAC).Nanoseconds())
+		atomic.AddInt64(&r.metrics.HMACCount, 1)
+	}
+
+	hmacMsg := message.NewMessage(r.id, slot, message.MessageKindHMAC, signature)
+	hmacBytes, err := hmacMsg.Marshal()
+	if err != nil {
+		return fmt.Errorf("failed to marshal adaptive batch HMAC: %v", err)
+	}
+
+	if r.enableBenchmarking {
+		l := uint64(len(hmacBytes))
+		atomic.AddUint64(&r.metrics.BytesSent, l)
+		atomic.AddUint64(&r.metrics.OverheadBytes, l)
+	}
+
+	err = r.broadcaster.Broadcast(r.ctx, hmacBytes)
+	if err != nil {
+		return fmt.Errorf("failed to broadcast adaptive batch HMAC: %v", err)
+	}
+
+	log.Printf("Sent Adaptive HMAC message (Batch of %d) for slot %d", count, slot)
+
+	targetSlot := slot + r.disclosureDelay
+	keyArray := [32]byte{}
+	copy(keyArray[:], key)
+
+	select {
+	case r.disclosureMessages <- DisclosurePayload{
+		Message:    packedData,
+		Key:        keyArray,
+		TargetSlot: targetSlot,
+	}:
+	default:
+		return fmt.Errorf("disclosure queue full")
+	}
+	return nil
+}
+
 func (r *RCD) disclosureWorker() {
 	defer r.wg.Done()
 	ticker := r.slotSource.Ticker(r.ctx)
@@ -570,7 +750,6 @@ func (r *RCD) disclosureWorker() {
 	for {
 		select {
 		case currentSlot := <-ticker:
-			// Drain new disclosures from channel
 			for {
 				select {
 				case disclosure := <-r.disclosureMessages:
@@ -643,7 +822,6 @@ func (r *RCD) cleanupWorker() {
 			retentionThreshold := r.disclosureDelay + 20
 			r.unverifiedMsgs.Range(func(key, value interface{}) bool {
 				if key.(uint64)+retentionThreshold < currentSlot {
-					// Silent cleanup (unless debugging)
 					r.unverifiedMsgs.Delete(key)
 				}
 				return true
@@ -671,6 +849,25 @@ func (r *RCD) handleMessage(data []byte) {
 	}
 
 	if receivedMessage.Kind == message.MessageKindData {
+		if r.mode == ModeAdaptive || r.mode == ModeProbAdaptive {
+			sched, rawData, err := unpackAdaptiveData(receivedMessage.Data)
+			if err != nil {
+				log.Printf("Failed to unpack adaptive data: %v", err)
+				return
+			}
+
+			tRecv := time.Since(r.startTime).Milliseconds()
+			maxSafeTime := int64(sched.Offset+(r.disclosureDelay*sched.Duration)) - 50
+
+			if tRecv > maxSafeTime {
+				log.Printf("[SECURITY] Dropped adaptive message for slot %d (arrived too late)", sched.Index)
+				return
+			}
+
+			r.storeUnverifiedMessage(sched.Index, rawData)
+			return
+		}
+
 		securityCutoff := receivedMessage.Slot + r.disclosureDelay
 		if currentSlot >= securityCutoff {
 			log.Printf("[SECURITY] Dropped message for slot %d (arrived too late)", receivedMessage.Slot)
@@ -710,7 +907,8 @@ func (r *RCD) handleMessage(data []byte) {
 			return
 		}
 
-		if r.mode == ModeProbabilistic {
+		switch r.mode {
+		case ModeProbabilistic:
 			bf := bloom.FromBytes(payload)
 			if bf != nil {
 				targetSlot := receivedMessage.Slot - r.disclosureDelay
@@ -726,12 +924,38 @@ func (r *RCD) handleMessage(data []byte) {
 				log.Printf("Probabilistic Batch Verification: %d messages authenticated for slot %d", verifiedCount, targetSlot)
 				r.unverifiedMsgs.Delete(targetSlot)
 			}
-		} else {
-			// Deterministic mode: Payload IS the message
+		case ModeAdaptive:
+			sched, actualData, err := unpackAdaptiveData(payload)
+			if err != nil {
+				log.Printf("Failed to unpack verified adaptive payload: %v", err)
+				return
+			}
+			log.Printf("[SUCCESS] Verified adaptive message from %s: %s (Slot %d, T_i %dms)", receivedMessage.SenderID, string(actualData), sched.Index, sched.Duration)
+			r.unverifiedMsgs.Delete(sched.Index)
+		case ModeProbAdaptive:
+			sched, bfPayload, err := unpackAdaptiveData(payload)
+			if err != nil {
+				log.Printf("Failed to unpack prob-adaptive payload: %v", err)
+				return
+			}
+			bf := bloom.FromBytes(bfPayload)
+			if bf != nil {
+				targetSlot := receivedMessage.Slot - r.disclosureDelay
+				msgs := r.getUnverifiedMessages(targetSlot)
+
+				verifiedCount := 0
+				for _, m := range msgs {
+					if bf.Check(m) {
+						verifiedCount++
+					}
+				}
+				log.Printf("[SUCCESS] Prob-Adaptive Batch Verification: %d messages authenticated for slot %d (T_i: %dms)", verifiedCount, targetSlot, sched.Duration)
+				r.unverifiedMsgs.Delete(targetSlot)
+			}
+		default:
 			log.Printf("[SUCCESS] Verified message from %s: %s", receivedMessage.SenderID, string(payload))
 		}
 	} else {
-		// HMAC Message
 		log.Printf("Received HMAC message from %s for slot %d", receivedMessage.SenderID, receivedMessage.Slot)
 		var hmacArray [32]byte
 		copy(hmacArray[:], receivedMessage.Data)
@@ -754,12 +978,32 @@ func (r *RCD) getUnverifiedMessages(slot uint64) [][]byte {
 	return value.([][]byte)
 }
 
+func packAdaptiveData(sched Schedule, data []byte) []byte {
+	buf := make([]byte, 24+len(data))
+	binary.BigEndian.PutUint64(buf[0:8], sched.Index)
+	binary.BigEndian.PutUint64(buf[8:16], sched.Duration)
+	binary.BigEndian.PutUint64(buf[16:24], sched.Offset)
+	copy(buf[24:], data)
+	return buf
+}
+
+func unpackAdaptiveData(payload []byte) (Schedule, []byte, error) {
+	if len(payload) < 24 {
+		return Schedule{}, nil, fmt.Errorf("payload too short for adaptive metadata")
+	}
+	sched := Schedule{
+		Index:    binary.BigEndian.Uint64(payload[0:8]),
+		Duration: binary.BigEndian.Uint64(payload[8:16]),
+		Offset:   binary.BigEndian.Uint64(payload[16:24]),
+	}
+	return sched, payload[24:], nil
+}
+
 func (r *RCD) verifyKey(senderID uuid.UUID, key []byte) bool {
 	commitmentKey, ok := r.commitmentKeys.Load(senderID)
 	if !ok {
 		contractKey, _, _, _, err := r.contract.GetKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
 		if err != nil || len(contractKey) == 0 {
-			// Log error via wrapping if we were returning, but here we just return bool
 			return false
 		}
 		commitmentKey = []byte(contractKey)

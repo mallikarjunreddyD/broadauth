@@ -1,12 +1,9 @@
 import subprocess
 import time
-
-# import uuid
 import re
 import os
-
-# import signal
 import sys
+import threading
 from statistics import mean
 from typing import List, Dict, Set
 
@@ -24,7 +21,7 @@ OWNER_BIN = "./bin/owner"
 ETH_URL = "http://0.0.0.0:8545"
 CONTRACT_ADDR = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
 OWNER_ADDR = "0.0.0.0:10102"
-HASHCHAIN_LEN = "64"
+HASHCHAIN_LEN = "512"
 DISCLOSURE_DELAY = "2"
 
 # Owner Specifics
@@ -63,7 +60,6 @@ def start_owner() -> subprocess.Popen[str]:
         OWNER_PORT,
     ]
 
-    # We use PIPE to capture stdout so we can read UUIDs
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
     )
@@ -80,36 +76,27 @@ def start_owner() -> subprocess.Popen[str]:
 def get_uuids_from_owner(owner_proc: subprocess.Popen[str], count: int) -> List[str]:
     print(f"[*] Waiting for {count} UUIDs from Owner...")
     uuids: List[str] = []
-
-    # We also want to save owner output to a log file while reading it
     owner_log_file = open(f"{BENCH_DIR}/owner.log", "w")
 
     if owner_proc.stdout is None:
         raise RuntimeError("Owner process stdout is None")
 
     start_time = time.time()
-    while time.time() - start_time < 10:  # Wait up to 10s for UUIDs
+    while time.time() - start_time < 15:  # Increased wait time for 4x UUIDs
         line = owner_proc.stdout.readline()
         if not line:
             break
 
-        # Write to log
         owner_log_file.write(line)
         owner_log_file.flush()
-
         line = line.strip()
-        # UUID Regex (simple check)
+
         if re.match(
             r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", line
         ):
             uuids.append(line)
             if len(uuids) >= count:
                 break
-
-    # Start a background thread or process to keep draining owner stdout to file
-    # For simplicity in this script, we'll just let the OS buffer fill or hope it's fine.
-    # Ideally, we should spawn a reader thread.
-    import threading
 
     def drain_owner_log() -> None:
         if owner_proc.stdout:
@@ -123,19 +110,14 @@ def get_uuids_from_owner(owner_proc: subprocess.Popen[str], count: int) -> List[
 
     if len(uuids) < count:
         print(f"[!] Warning: Only captured {len(uuids)} UUIDs. Expected {count}.")
-        print("    If the Owner didn't print them, RCD(s will fail to co,nnect.")
     else:
         print(f"[*] Successfully captured {len(uuids)} UUIDs.")
-
     return uuids
 
 
 def run_rcd_benchmark(mode: str, run_id: int, uid: str) -> str:
-    # uid is passed in now!
     log_filename = f"{BENCH_DIR}/run_{run_id:02d}_{mode}_{uid}.log"
-
     print(f"    -> Running {mode} (UUID: {uid})")
-    print(f"    -> Log: {log_filename}")
 
     cmd: List[str] = [
         RCD_BIN,
@@ -156,9 +138,12 @@ def run_rcd_benchmark(mode: str, run_id: int, uid: str) -> str:
         mode,
     ]
 
+    # Add adaptive bounds if running adaptive modes
+    if mode in ["adaptive", "probadaptive"]:
+        cmd.extend(["-t-min", "12000", "-t-max", "24000"])
+
     with open(log_filename, "w") as log_file:
         proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
-
         try:
             time.sleep(DURATION)
         except KeyboardInterrupt:
@@ -182,7 +167,7 @@ def parse_log_file(filepath: str) -> Dict[float, Dict[str, float]]:
             match = LOG_PATTERN.search(line)
             if match:
                 t = float(match.group(1))
-                metrics: Dict[str, float] = {
+                data_points[t] = {
                     "tx_rate": float(match.group(2)),
                     "rx_rate": float(match.group(3)),
                     "msg_rate": float(match.group(4)),
@@ -192,7 +177,6 @@ def parse_log_file(filepath: str) -> Dict[float, Dict[str, float]]:
                     "verify_lat": float(match.group(8)),
                     "bcast_lat": float(match.group(9)),
                 }
-                data_points[t] = metrics
     return data_points
 
 
@@ -208,29 +192,28 @@ def aggregate_data(
         valid_runs = [run[t] for run in all_runs_data if t in run]
         if not valid_runs:
             continue
-
-        avg = {k: mean([d[k] for d in valid_runs]) for k in valid_runs[0].keys()}
-        aggregated[t] = avg
+        aggregated[t] = {
+            k: mean([d[k] for d in valid_runs]) for k in valid_runs[0].keys()
+        }
     return aggregated
 
 
 def generate_markdown(
-    det_data: Dict[float, Dict[str, float]], prob_data: Dict[float, Dict[str, float]]
+    det_data: Dict[float, Dict[str, float]],
+    prob_data: Dict[float, Dict[str, float]],
+    adapt_data: Dict[float, Dict[str, float]],
+    probadapt_data: Dict[float, Dict[str, float]],
 ) -> None:
     def format_table(title: str, data: Dict[float, Dict[str, float]]) -> str:
-        lines: List[str] = []
-        lines.append(f"### {title}")
+        lines: List[str] = [f"### {title}"]
         lines.append(
             "| Time (s) | Tx Rate (B/s) | Rx Rate (B/s) | Msg/s | Mem (MB) | Overhead (B) | HMAC (µs) | Verify (µs) | Bcast (µs) |"
         )
         lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-
         for t in sorted(data.keys()):
             d = data[t]
             lines.append(
-                f"| {t:.1f} | {d['tx_rate']:.2f} | {d['rx_rate']:.2f} | {d['msg_rate']:.1f} | "
-                f"{d['mem']:.2f} | {int(d['overhead'])} | {d['hmac_lat']:.2f} | "
-                f"{d['verify_lat']:.2f} | {d['bcast_lat']:.2f} |"
+                f"| {t:.1f} | {d['tx_rate']:.2f} | {d['rx_rate']:.2f} | {d['msg_rate']:.1f} | {d['mem']:.2f} | {int(d['overhead'])} | {d['hmac_lat']:.2f} | {d['verify_lat']:.2f} | {d['bcast_lat']:.2f} |"
             )
         return "\n".join(lines)
 
@@ -243,14 +226,14 @@ def generate_markdown(
 - Disclosure Delay: {DISCLOSURE_DELAY}
 
 ---
-
-{format_table("Deterministic Mode (Average)", det_data)}
-
+{format_table("Deterministic Mode", det_data)}
 ---
-
-{format_table("Probabilistic Mode (Average)", prob_data)}
+{format_table("Probabilistic Mode", prob_data)}
+---
+{format_table("Adaptive Mode", adapt_data)}
+---
+{format_table("Prob-Adaptive Mode", probadapt_data)}
 """
-
     with open(FINAL_REPORT, "w") as f:
         f.write(content)
     print(f"\n[*] Report generated: {FINAL_REPORT}")
@@ -261,52 +244,54 @@ def main() -> None:
     owner_proc = start_owner()
 
     try:
-        # Capture UUIDs (Total needed = 2 * RUNS_PER_MODE)
-        total_uuids_needed = 2 * RUNS_PER_MODE
+        total_uuids_needed = 4 * RUNS_PER_MODE
         uuids = get_uuids_from_owner(owner_proc, total_uuids_needed)
 
-        # Split UUIDs
         det_uuids = uuids[:RUNS_PER_MODE]
-        prob_uuids = uuids[RUNS_PER_MODE:]
-
-        if len(det_uuids) < RUNS_PER_MODE or len(prob_uuids) < RUNS_PER_MODE:
-            print("[!] Not enough UUIDs captured to run full benchmark suite.")
-            # You might want to exit here or run fewer benchmarks
+        prob_uuids = uuids[RUNS_PER_MODE : RUNS_PER_MODE * 2]
+        adapt_uuids = uuids[RUNS_PER_MODE * 2 : RUNS_PER_MODE * 3]
+        probadapt_uuids = uuids[RUNS_PER_MODE * 3 :]
 
         det_raw_data: List[Dict[float, Dict[str, float]]] = []
         prob_raw_data: List[Dict[float, Dict[str, float]]] = []
+        adapt_raw_data: List[Dict[float, Dict[str, float]]] = []
+        probadapt_raw_data: List[Dict[float, Dict[str, float]]] = []
 
         print(
             f"\n[*] Starting Benchmark Suite ({RUNS_PER_MODE} runs per mode, {DURATION}s each)"
         )
 
-        # 1. Deterministic Loop
         print("\n--- Phase 1: Deterministic Mode ---")
         for i, uid in enumerate(det_uuids):
-            run_num = i + 1
-            print(f"[*] Run {run_num}/{RUNS_PER_MODE}...")
-            # Pass the UID here!
-            log_file = run_rcd_benchmark("deterministic", run_num, uid)
-            run_data = parse_log_file(log_file)
-            det_raw_data.append(run_data)
+            log_file = run_rcd_benchmark("deterministic", i + 1, uid)
+            det_raw_data.append(parse_log_file(log_file))
             time.sleep(1)
 
-        # 2. Probabilistic Loop
         print("\n--- Phase 2: Probabilistic Mode ---")
         for i, uid in enumerate(prob_uuids):
-            run_num = i + 1
-            print(f"[*] Run {run_num}/{RUNS_PER_MODE}...")
-            # Pass the UID here!
-            log_file = run_rcd_benchmark("probabilistic", run_num, uid)
-            run_data = parse_log_file(log_file)
-            prob_raw_data.append(run_data)
+            log_file = run_rcd_benchmark("probabilistic", i + 1, uid)
+            prob_raw_data.append(parse_log_file(log_file))
+            time.sleep(1)
+
+        print("\n--- Phase 3: Adaptive Mode ---")
+        for i, uid in enumerate(adapt_uuids):
+            log_file = run_rcd_benchmark("adaptive", i + 1, uid)
+            adapt_raw_data.append(parse_log_file(log_file))
+            time.sleep(1)
+
+        print("\n--- Phase 4: Prob-Adaptive Mode ---")
+        for i, uid in enumerate(probadapt_uuids):
+            log_file = run_rcd_benchmark("probadaptive", i + 1, uid)
+            probadapt_raw_data.append(parse_log_file(log_file))
             time.sleep(1)
 
         print("\n[*] Aggregating data...")
-        det_avg = aggregate_data(det_raw_data)
-        prob_avg = aggregate_data(prob_raw_data)
-
-        generate_markdown(det_avg, prob_avg)
+        generate_markdown(
+            aggregate_data(det_raw_data),
+            aggregate_data(prob_raw_data),
+            aggregate_data(adapt_raw_data),
+            aggregate_data(probadapt_raw_data),
+        )
 
     finally:
         print("[*] Stopping Owner Node...")

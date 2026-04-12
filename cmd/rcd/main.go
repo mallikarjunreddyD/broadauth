@@ -21,10 +21,10 @@ func main() {
 	hashchainLen := flag.Int("hashchain-len", 1024, "Length of hashchains")
 	disclosureDelay := flag.Uint64("disclosure-delay", 2, "Disclosure delay for key revelation")
 	simulationTime := flag.Duration("simulation-time", 3*time.Minute, "Duration to run the simulation")
-	modeStr := flag.String("mode", "", "Operation mode: 'deterministic' or 'probabilistic'")
-	
-	// NEW FLAG
+	modeStr := flag.String("mode", "", "Operation mode: 'deterministic', 'probabilistic', 'adaptive' or 'prob-adaptive")
 	bench := flag.Bool("bench", false, "Enable runtime benchmarking metrics")
+	tMin := flag.Uint64("t-min", 1000, "Minimum slot duration in ms (Adaptive Mode)")
+	tMax := flag.Uint64("t-max", 10000, "Maximum slot duration in ms (Adaptive Mode)")
 
 	flag.Parse()
 
@@ -46,6 +46,12 @@ func main() {
 	case "probabilistic", "prob":
 		mode = rcd.ModeProbabilistic
 		log.Println("Starting RCD in PROBABILISTIC mode")
+	case "adaptive", "adapt":
+		mode = rcd.ModeAdaptive
+		log.Println("Starting RCD in ADAPTIVE mode")
+	case "probadaptive", "probad":
+		mode = rcd.ModeProbAdaptive
+		log.Println("Starting RCD in ADAPTIVE mode")
 	default:
 		log.Fatalf("Unknown mode: %s", *modeStr)
 	}
@@ -59,7 +65,9 @@ func main() {
 		DisclosureDelay:    *disclosureDelay,
 		SimulationTime:     *simulationTime,
 		Mode:               mode,
-		EnableBenchmarking: *bench, // Pass the flag value
+		EnableBenchmarking: *bench,
+		TMin:               *tMin,
+		TMax:               *tMax,
 	}
 
 	r, err := rcd.New(cfg)

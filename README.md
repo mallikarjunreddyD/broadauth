@@ -59,7 +59,8 @@ cd ..
     -port 10101
 ```
 
-4. Run an owner on port `10102`
+4. Run an owner on port 10102.
+_(Note: You can change the `-mode` flag to `deterministic`, `probabilistic`, `adaptive`, or `probadaptive`. When using adaptive modes, specify `-t-min` and `-t-max`.)_
 
 ```bash
 ./bin/owner \
@@ -69,10 +70,13 @@ cd ..
     -cm-addr 0.0.0.0:10101 \
     -disclosure-delay 2 \
     -hashchain-len 64 \
-    -port 10102
+    -port 10102 \
+    -mode adaptive \
+    -t-min 1000 \
+    -t-max 8000
 ```
 
-5. Run an RCD (Change the uuid to use from the ones printed by the owner)
+5. Run an RCD _(Change the uuid to use from the ones printed by the owner)_
 
 ```bash
 ./bin/rcd \
@@ -81,5 +85,46 @@ cd ..
     -eth-url http://0.0.0.0:8545 \
     -hashchain-len 64 \
     -owner-addr 0.0.0.0:10102 \
-    -uuid 8bfe24ae-d641-4522-ba83-3eab387a8fb3
+    -uuid 8bfe24ae-d641-4522-ba83-3eab387a8fb3 \
+    -mode adaptive \
+    -t-min 1000 \
+    -t-max 8000
 ```
+
+## Automated Benchmarking & Chart Generation
+
+The project includes an automated Python suite to run all four protocol modes back-to-back, parse the output logs, and generate comparative Matplotlib charts.
+
+1. Install Python Dependencies
+
+Ensure you have `matplotlib` and `numpy` installed. If you are managing Python packages natively, you can grab them from the repos:
+
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install matplotlib numpy
+```
+
+2. Start the Backend Infrastructure
+
+Ensure `anvil` (Step 1) and the `cm` (Consortium Manager) (Step 3) are running in the background.
+
+3. Run the Benchmark Suite
+
+The script will automatically spawn the `owner` daemon, capture the UUIDs, and orchestrate the `rcd` nodes across all 4 modes.
+
+```bash
+python benchmarking/benchmark.py
+```
+
+_This will take several minutes to run through the iterations. It will output an aggregated `avg_benchmarks.md` report upon completion._
+
+4. Generate Plots
+
+Parse the generated markdown data to create visual comparisons of throughput, latency, bandwidth, and memory usage.
+
+```bash
+python benchmarking/generate_charts.py
+```
+
+Check the `/plots` directory for the resulting `.png` files!

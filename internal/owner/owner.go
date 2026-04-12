@@ -11,10 +11,12 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"strings"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	contracts "github.com/virinci/broadauth/internal/contract"
 
@@ -42,6 +44,9 @@ type Owner struct {
 	contract        *contracts.Contract
 	auth            *bind.TransactOpts
 	disclosureDelay uint64
+	mode            string
+	tMin            uint64
+	tMax            uint64
 }
 
 type Config struct {
@@ -52,6 +57,9 @@ type Config struct {
 	ContractAddr    string
 	PrivateKey      string
 	DisclosureDelay uint64
+	Mode            string
+	TMin            uint64
+	TMax            uint64
 }
 
 func New(cfg Config) (*Owner, error) {
@@ -110,6 +118,9 @@ func New(cfg Config) (*Owner, error) {
 		contract:        contract,
 		auth:            auth,
 		disclosureDelay: cfg.DisclosureDelay,
+		mode:            strings.ToLower(cfg.Mode),
+		tMin:            cfg.TMin,
+		tMax:            cfg.TMax,
 	}, nil
 }
 
@@ -220,17 +231,38 @@ func (o *Owner) handleRCD(conn net.Conn) {
 		"RCD:%s index:%d startTime:%d endTime:%d delay:%d",
 		id, nextIndex.Uint64(), startTime.Uint64(), endTime.Uint64(), disclosureDelay.Uint64())
 
-	tx, err := o.contract.StoreKey(
-		o.auth,
-		rcdBigInt,
-		nextIndex,
-		string(first),
-		startTime,
-		endTime,
-		disclosureDelay,
-	)
-	if err != nil {
-		log.Printf("RCD:%s storeKey failed: %v", id, err)
+	var tx *types.Transaction
+	var errTx error
+
+	// Branch logic based on configuration mode
+	if o.mode == "adaptive" || o.mode == "probadaptive" {
+		tMinBig := new(big.Int).SetUint64(o.tMin)
+		tMaxBig := new(big.Int).SetUint64(o.tMax)
+		tx, errTx = o.contract.StoreAdaptiveKey(
+			o.auth,
+			rcdBigInt,
+			nextIndex,
+			string(first),
+			startTime,
+			endTime,
+			disclosureDelay,
+			tMinBig,
+			tMaxBig,
+		)
+	} else {
+		tx, errTx = o.contract.StoreKey(
+			o.auth,
+			rcdBigInt,
+			nextIndex,
+			string(first),
+			startTime,
+			endTime,
+			disclosureDelay,
+		)
+	}
+
+	if errTx != nil {
+		log.Printf("RCD:%s storeKey failed: %v", id, errTx)
 		return
 	}
 

@@ -12,6 +12,8 @@ contract InfTESLAplusplus {
         mapping(uint => uint) disclosureDelay;
         mapping(uint => string) key;
         mapping(uint => bool) isIndexExist;
+        mapping(uint => uint) tMin;
+        mapping(uint => uint) tMax;
         uint currentIndex;
     }
 
@@ -37,6 +39,46 @@ contract InfTESLAplusplus {
         uint _endTime,
         uint _disclosurDelay
     ) public {
+        _validateAndStoreCore(
+            _rcd,
+            _index,
+            _key,
+            _startTime,
+            _endTime,
+            _disclosurDelay
+        );
+    }
+
+    function storeAdaptiveKey(
+        uint _rcd,
+        uint _index,
+        string memory _key,
+        uint _startTime,
+        uint _endTime,
+        uint _disclosurDelay,
+        uint _tMin,
+        uint _tMax
+    ) public {
+        _validateAndStoreCore(
+            _rcd,
+            _index,
+            _key,
+            _startTime,
+            _endTime,
+            _disclosurDelay
+        );
+        RCDs[_rcd].tMin[_index] = _tMin;
+        RCDs[_rcd].tMax[_index] = _tMax;
+    }
+
+    function _validateAndStoreCore(
+        uint _rcd,
+        uint _index,
+        string memory _key,
+        uint _startTime,
+        uint _endTime,
+        uint _disclosurDelay
+    ) internal {
         require(
             RCDs[_rcd].isTaken == true,
             "Keys can be stored for only active RCDs"
@@ -73,6 +115,20 @@ contract InfTESLAplusplus {
             RCDs[_rcd].startTime[currentIndex],
             RCDs[_rcd].endTime[currentIndex],
             RCDs[_rcd].disclosureDelay[currentIndex]
+        );
+    }
+
+    function getAdaptiveKey(
+        uint _rcd
+    ) public view returns (string memory, uint, uint, uint, uint, uint) {
+        uint currentIndex = RCDs[_rcd].currentIndex;
+        return (
+            RCDs[_rcd].key[currentIndex],
+            RCDs[_rcd].startTime[currentIndex],
+            RCDs[_rcd].endTime[currentIndex],
+            RCDs[_rcd].disclosureDelay[currentIndex],
+            RCDs[_rcd].tMin[currentIndex],
+            RCDs[_rcd].tMax[currentIndex]
         );
     }
 

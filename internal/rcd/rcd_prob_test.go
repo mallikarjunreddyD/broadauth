@@ -54,10 +54,10 @@ func TestFlushBatchProbabilistic(t *testing.T) {
 	copy(r.cachedKey[:], key)
 
 	// Buffer a couple of messages and flush
-	if err := r.bufferForBatch([]byte("m1")); err != nil {
+	if err := r.broadcastProbabilistic([]byte("m1")); err != nil {
 		t.Fatalf("buffer failed: %v", err)
 	}
-	if err := r.bufferForBatch([]byte("m2")); err != nil {
+	if err := r.broadcastProbabilistic([]byte("m2")); err != nil {
 		t.Fatalf("buffer failed: %v", err)
 	}
 

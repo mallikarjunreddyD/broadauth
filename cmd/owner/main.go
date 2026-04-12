@@ -20,6 +20,10 @@ func main() {
 	contractAddr := flag.String("contract", "", "Contract address (required)")
 	privKey := flag.String("private-key", "", "Owner private key in hex format (required)")
 	disclosureDelay := flag.Uint64("disclosure-delay", 2, "Disclosure delay for key revelation")
+	mode := flag.String("mode", "deterministic", "Operational mode: deterministic, probabilistic, adaptive, probadaptive")
+	tMin := flag.Uint64("t-min", 1000, "Minimum slot duration in ms (Adaptive Mode)")
+	tMax := flag.Uint64("t-max", 10000, "Maximum slot duration in ms (Adaptive Mode)")
+	numRCDs := flag.Int("num-rcds", 40, "Number of RCD UUIDs to generate on startup")
 
 	flag.Parse()
 
@@ -36,6 +40,9 @@ func main() {
 		ContractAddr:    *contractAddr,
 		PrivateKey:      *privKey,
 		DisclosureDelay: *disclosureDelay,
+		Mode:            *mode,
+		TMin:            *tMin,
+		TMax:            *tMax,
 	}
 
 	o, err := owner.New(cfg)
@@ -45,7 +52,7 @@ func main() {
 	defer o.Close()
 
 	var rcds []uuid.UUID
-	for range 20 {
+	for range *numRCDs {
 		rcds = append(rcds, o.NewRCD())
 	}
 
