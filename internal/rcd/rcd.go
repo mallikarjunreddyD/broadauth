@@ -76,7 +76,6 @@ type RCD struct {
 	receivedHMACs      sync.Map
 	commitmentKeys     sync.Map
 
-	// Buffer for Probabilistic/Hybrid Mode Receiver: Map[Slot] -> List of Data Messages
 	unverifiedMsgs sync.Map
 
 	ctx    context.Context
@@ -94,8 +93,9 @@ type RCD struct {
 
 	adaptiveT      uint64
 	adaptiveOffset uint64
+	tMin           uint64
+	tMax           uint64
 
-	// Performance Metrics
 	metrics Metrics
 }
 
@@ -177,6 +177,9 @@ func New(cfg Config) (*RCD, error) {
 		disclosureMessages: make(chan DisclosurePayload, 1024),
 		messageBuffer:      make([][]byte, 0),
 		mode:               cfg.Mode,
+		tMin:               cfg.TMin,
+		tMax:               cfg.TMax,
+		adaptiveT:          cfg.TMin,
 		enableBenchmarking: cfg.EnableBenchmarking,
 	}, nil
 }
@@ -205,11 +208,12 @@ func (r *RCD) Start() error {
 	go r.cleanupWorker()
 
 	modeStr := "DETERMINISTIC"
-	if r.mode == ModeProbabilistic {
+	switch r.mode {
+	case ModeProbabilistic:
 		modeStr = "PROBABILISTIC"
-	} else if r.mode == ModeAdaptive {
+	case ModeAdaptive:
 		modeStr = "ADAPTIVE"
-	} else if r.mode == ModeProbAdaptive {
+	case ModeProbAdaptive:
 		modeStr = "PROB-ADAPTIVE"
 	}
 
@@ -366,7 +370,7 @@ func (r *RCD) broadcastLoop() {
 				switch r.mode {
 				case ModeProbAdaptive:
 					if err := r.flushAdaptiveBatch(slotToFlush); err != nil {
-						log.Printf("Failed to flush adaptive batch for slot %d: %v", slotToFlush, err)
+						log.Printf("[PROB-ADAPTIVE: FLUSH-ERROR] Failed to flush adaptive batch for slot %d: %v", slotToFlush, err)
 					}
 				case ModeProbabilistic:
 					if err := r.flushBatch(slotToFlush); err != nil {
@@ -374,6 +378,40 @@ func (r *RCD) broadcastLoop() {
 					}
 				}
 			}(currentSlot - 1)
+
+			if r.mode == ModeAdaptive || r.mode == ModeProbAdaptive {
+				queueLen := float64(len(r.disclosureMessages))
+				di := queueLen / 1024.0 // Assuming 1024 is the channel capacity
+				
+				var avgLatNs float64
+				count := atomic.LoadInt64(&r.metrics.BroadcastCount)
+				dur := atomic.LoadInt64(&r.metrics.BroadcastDuration)
+				if count > 0 {
+					avgLatNs = float64(dur) / float64(count)
+				}
+				bi := (avgLatNs / 1e6) / 20.0 // 20ms baseline
+				if bi > 1.0 { bi = 1.0 }
+
+				score := r.calculateTimeCongestion()
+
+				r.bufferMutex.Lock()
+				nextT := r.selectDuration(score, r.adaptiveT)
+
+				log.Printf("[PROB-ADAPTIVE: METRICS] Slot: %d | D_i (Queue): %.2f | B_i (Latency): %.2f | C_i (Score): %.2f", 
+					currentSlot, di, bi, score)
+
+				if nextT != r.adaptiveT {
+					log.Printf("[PROB-ADAPTIVE: TOGGLE-ACTION] Threshold breached! Slot %d | Scaling T_i: %dms -> %dms",
+						currentSlot, r.adaptiveT, nextT)
+
+					r.adaptiveT = nextT
+
+					if adaptiveSrc, ok := r.slotSource.(*slot.AdaptiveSlotSource); ok {
+						adaptiveSrc.SetDuration(nextT)
+					}
+				}
+				r.bufferMutex.Unlock()
+			}
 		}
 	}
 }
@@ -430,9 +468,6 @@ func (r *RCD) broadcast(data []byte) error {
 	// 1. Pack data with schedule if in ANY adaptive mode
 	if r.mode == ModeAdaptive || r.mode == ModeProbAdaptive {
 		r.bufferMutex.Lock()
-		if r.adaptiveT == 0 {
-			r.adaptiveT = 3000 // Default T_i
-		}
 		sched = Schedule{
 			Index:    currentSlot,
 			Duration: r.adaptiveT,
@@ -478,7 +513,7 @@ func (r *RCD) broadcast(data []byte) error {
 	case ModeAdaptive:
 		return r.broadcastAdaptive(payloadToBroadcast, key, currentSlot, sched)
 	case ModeProbAdaptive:
-		return r.broadcastProbadaptive(data) // Buffer raw data for BF
+		return r.broadcastProbadaptive(data)
 	default:
 		return fmt.Errorf("unknown mode")
 	}
@@ -544,6 +579,7 @@ func (r *RCD) broadcastProbadaptive(data []byte) error {
 	r.bufferMutex.Lock()
 	defer r.bufferMutex.Unlock()
 	r.messageBuffer = append(r.messageBuffer, data)
+	log.Printf("[PROB-ADAPTIVE: INGEST] Buffered packet. Current batch size: %d", len(r.messageBuffer))
 	return nil
 }
 
@@ -668,17 +704,18 @@ func (r *RCD) flushBatch(slot uint64) error {
 
 func (r *RCD) flushAdaptiveBatch(slot uint64) error {
 	r.bufferMutex.Lock()
+
+	log.Printf("[PROB-ADAPTIVE: FLUSH] Slot %d initiated. Extracting %d packets from buffer.", slot, len(r.messageBuffer))
+
 	if len(r.messageBuffer) == 0 {
 		r.bufferMutex.Unlock()
+		log.Printf("[PROB-ADAPTIVE: FLUSH] Slot %d empty. Skipping broadcast.", slot)
 		return nil
 	}
 	messages := r.messageBuffer
 	count := len(messages)
 	r.messageBuffer = make([][]byte, 0)
 
-	if r.adaptiveT == 0 {
-		r.adaptiveT = 3000
-	}
 	sched := Schedule{
 		Index:    slot,
 		Duration: r.adaptiveT,
@@ -695,10 +732,15 @@ func (r *RCD) flushAdaptiveBatch(slot uint64) error {
 
 	packedData := packAdaptiveData(sched, bfData)
 
+	log.Printf("[PROB-ADAPTIVE: FLUSH] Created Bloom Filter. Compressed %d packets into %d bytes.", count, len(packedData))
+
 	_, key, err := r.CurrentSlotKey()
 	if err != nil {
+		log.Printf("[PROB-ADAPTIVE: FLUSH-ERROR] Failed to get key for slot %d: %v", slot, err)
 		return fmt.Errorf("failed to get current slot/key for adaptive batch flush: %v", err)
 	}
+
+	log.Printf("[PROB-ADAPTIVE: FLUSH] Acquired Key for Slot %d. Proceeding to HMAC & Broadcast.", slot)
 
 	startHMAC := time.Now()
 	signature := r.calculateHMAC(key, packedData)
@@ -721,10 +763,11 @@ func (r *RCD) flushAdaptiveBatch(slot uint64) error {
 
 	err = r.broadcaster.Broadcast(r.ctx, hmacBytes)
 	if err != nil {
+		log.Printf("[PROB-ADAPTIVE: FLUSH-ERROR] Broadcast failed on slot %d: %v", slot, err)
 		return fmt.Errorf("failed to broadcast adaptive batch HMAC: %v", err)
 	}
 
-	log.Printf("Sent Adaptive HMAC message (Batch of %d) for slot %d", count, slot)
+	log.Printf("[PROB-ADAPTIVE: FLUSH-SUCCESS] Batch of %d packets for slot %d broadcasted successfully.", count, slot)
 
 	targetSlot := slot + r.disclosureDelay
 	keyArray := [32]byte{}
@@ -1034,4 +1077,47 @@ func (r *RCD) calculateHMAC(key, data []byte) []byte {
 	h := hmac.New(sha256.New, key)
 	h.Write(data)
 	return h.Sum(nil)
+}
+
+func (r *RCD) calculateTimeCongestion() float64 {
+	queueLen := float64(len(r.disclosureMessages))
+	queueCap := 1024.0
+	disclosureQueue := queueLen / queueCap
+
+	var avgLatNs float64
+	count := atomic.LoadInt64(&r.metrics.BroadcastCount)
+	dur := atomic.LoadInt64(&r.metrics.BroadcastDuration)
+	if count > 0 {
+		avgLatNs = float64(dur) / float64(count)
+	}
+
+	broadcastLatency := (avgLatNs / 1e6) / 20.0 // 20.0ms baseline
+	if broadcastLatency > 1.0 {
+		broadcastLatency = 1.0 // Clamped to 1.0 maximum
+	}
+
+	// Default Weights
+	wDisc := 0.70
+	wLat := 0.30
+
+	return (wDisc * disclosureQueue) + (wLat * broadcastLatency)
+}
+
+func (r *RCD) selectDuration(score float64, currentT uint64) uint64 {
+	nextT := currentT
+
+	if score > 0.75 {
+		nextT = currentT * 2
+	} else if score < 0.25 {
+		nextT = currentT / 2
+	}
+
+	if nextT > r.tMax {
+		nextT = r.tMax
+	}
+	if nextT < r.tMin {
+		nextT = r.tMin
+	}
+
+	return nextT
 }

@@ -135,7 +135,7 @@ contract InfTESLAplusplus {
     function changeCurrentIndex(uint _rcd) public {
         uint currentIndex = RCDs[_rcd].currentIndex;
         require(
-            RCDs[_rcd].endTime[currentIndex] < block.number,
+            RCDs[_rcd].endTime[currentIndex] < block.timestamp,
             "New chain can only started after the old chain expires"
         );
         require(

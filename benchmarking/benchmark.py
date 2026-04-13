@@ -140,7 +140,7 @@ def run_rcd_benchmark(mode: str, run_id: int, uid: str) -> str:
 
     # Add adaptive bounds if running adaptive modes
     if mode in ["adaptive", "probadaptive"]:
-        cmd.extend(["-t-min", "12000", "-t-max", "24000"])
+        cmd.extend(["-t-min", "1000", "-t-max", "8000"])
 
     with open(log_filename, "w") as log_file:
         proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
