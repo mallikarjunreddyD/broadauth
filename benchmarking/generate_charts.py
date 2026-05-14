@@ -1,5 +1,5 @@
-import matplotlib.pyplot as plt  # type: ignore
-import numpy as np  # type: ignore
+import matplotlib.pyplot as plt
+import numpy as np
 import os
 from typing import List, Dict, Tuple
 
@@ -100,7 +100,7 @@ def save_chart(
     log_scale: bool = False,
     is_line: bool = False,
 ) -> None:
-    plt.figure(figsize=(12, 7))  # type: ignore
+    plt.figure(figsize=(12, 7))
 
     colors = {
         "Deterministic": "#1f77b4",
@@ -115,29 +115,44 @@ def save_chart(
         "Prob-Adaptive": "D",
     }
 
-    x_indices = np.array(x_data)  # type: ignore
+    x_indices = np.array(x_data)
 
     if is_line:
         for label, y_vals in y_data_dict.items():
-            plt.plot(x_indices[: len(y_vals)], y_vals, label=label, color=colors[label], marker=markers[label], linewidth=2, alpha=0.9)  # type: ignore
+            plt.plot(
+                x_indices[: len(y_vals)],
+                y_vals,
+                label=label,
+                color=colors[label],
+                marker=markers[label],
+                linewidth=2,
+                alpha=0.9,
+            )
     else:
         bar_width = 1.0
         offsets = [-1.5 * bar_width, -0.5 * bar_width, 0.5 * bar_width, 1.5 * bar_width]
         for i, (label, y_vals) in enumerate(y_data_dict.items()):
-            plt.bar(x_indices[: len(y_vals)] + offsets[i], y_vals, width=bar_width, label=label, color=colors[label], alpha=0.85)  # type: ignore
+            plt.bar(
+                x_indices[: len(y_vals)] + offsets[i],
+                y_vals,
+                width=bar_width,
+                label=label,
+                color=colors[label],
+                alpha=0.85,
+            )
 
-    plt.title(title, fontsize=14, fontweight="bold", pad=15)  # type: ignore
-    plt.xlabel("Time (s)", fontsize=12)  # type: ignore
-    plt.ylabel(y_label, fontsize=12)  # type: ignore
-    plt.grid(True, linestyle="--", alpha=0.5)  # type: ignore
-    plt.legend(fontsize=10)  # type: ignore
+    plt.title(title, fontsize=14, fontweight="bold", pad=15)
+    plt.xlabel("Time (s)", fontsize=12)
+    plt.ylabel(y_label, fontsize=12)
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.legend(fontsize=10)
 
     if log_scale:
-        plt.yscale("log")  # type: ignore
+        plt.yscale("log")
 
     path = os.path.join(output_dir, filename)
-    plt.savefig(path, dpi=300, bbox_inches="tight")  # type: ignore
-    plt.close()  # type: ignore
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
     print(f"Saved: {path}")
 
 
