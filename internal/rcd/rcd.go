@@ -195,7 +195,7 @@ func (r *RCD) Start() error {
 	r.startTime = time.Now()
 
 	if r.enableBenchmarking {
-		log.SetOutput(io.Discard)
+		// log.SetOutput(io.Discard)
 		r.wg.Add(4)
 		go r.benchmarkWorker()
 	} else {
@@ -351,7 +351,7 @@ func (r *RCD) requestHashChainOnce(currentSlot uint64) error {
 
 func (r *RCD) broadcastLoop() {
 	defer r.wg.Done()
-	trafficTicker := time.NewTicker(2 * time.Second)
+	trafficTicker := time.NewTicker(20 * time.Millisecond)
 	defer trafficTicker.Stop()
 	slotTicker := r.slotSource.Ticker(r.ctx)
 
@@ -380,8 +380,7 @@ func (r *RCD) broadcastLoop() {
 			}(currentSlot - 1)
 
 			if r.mode == ModeAdaptive || r.mode == ModeProbAdaptive {
-				queueLen := float64(len(r.disclosureMessages))
-				di := queueLen / 1024.0 // Assuming 1024 is the channel capacity
+				di := float64(len(r.messageBuffer)) / 10.0 // Assuming 100 is the channel capacity
 				
 				var avgLatNs float64
 				count := atomic.LoadInt64(&r.metrics.BroadcastCount)
@@ -389,7 +388,9 @@ func (r *RCD) broadcastLoop() {
 				if count > 0 {
 					avgLatNs = float64(dur) / float64(count)
 				}
-				bi := (avgLatNs / 1e6) / 20.0 // 20ms baseline
+				// bi := (avgLatNs / 1e6) / 20.0 // 20ms baseline
+				// Higher baseline for RCDs
+				bi := (avgLatNs / 1e6) / 50.0 // 50ms baseline
 				if bi > 1.0 { bi = 1.0 }
 
 				score := r.calculateTimeCongestion()
@@ -755,6 +756,23 @@ func (r *RCD) flushAdaptiveBatch(slot uint64) error {
 		return fmt.Errorf("failed to marshal adaptive batch HMAC: %v", err)
 	}
 
+	// --- CRITICAL FIX: QUEUE THE KEY FIRST ---
+	// Drop the key into the queue before getting stuck at the hardware interface.
+	targetSlot := slot + r.disclosureDelay
+	keyArray := [32]byte{}
+	copy(keyArray[:], key)
+
+	select {
+	case r.disclosureMessages <- DisclosurePayload{
+		Message:    packedData,
+		Key:        keyArray,
+		TargetSlot: targetSlot,
+	}:
+	default:
+		return fmt.Errorf("disclosure queue full")
+	}
+
+	// --- NOW BROADCAST (AND BLOCK) ---
 	if r.enableBenchmarking {
 		l := uint64(len(hmacBytes))
 		atomic.AddUint64(&r.metrics.BytesSent, l)
@@ -769,19 +787,6 @@ func (r *RCD) flushAdaptiveBatch(slot uint64) error {
 
 	log.Printf("[PROB-ADAPTIVE: FLUSH-SUCCESS] Batch of %d packets for slot %d broadcasted successfully.", count, slot)
 
-	targetSlot := slot + r.disclosureDelay
-	keyArray := [32]byte{}
-	copy(keyArray[:], key)
-
-	select {
-	case r.disclosureMessages <- DisclosurePayload{
-		Message:    packedData,
-		Key:        keyArray,
-		TargetSlot: targetSlot,
-	}:
-	default:
-		return fmt.Errorf("disclosure queue full")
-	}
 	return nil
 }
 
@@ -810,7 +815,7 @@ func (r *RCD) disclosureWorker() {
 				}
 				disclosureMsg := message.NewMessage(
 					r.id,
-					currentSlot,
+					disclosure.TargetSlot,
 					message.MessageKindKeyMessage,
 					append(disclosure.Key[:], disclosure.Message...),
 				)
@@ -899,10 +904,8 @@ func (r *RCD) handleMessage(data []byte) {
 				return
 			}
 
-			tRecv := time.Since(r.startTime).Milliseconds()
-			maxSafeTime := int64(sched.Offset+(r.disclosureDelay*sched.Duration)) - 50
-
-			if tRecv > maxSafeTime {
+			securityCutoff := sched.Index + r.disclosureDelay
+			if currentSlot >= securityCutoff {
 				log.Printf("[SECURITY] Dropped adaptive message for slot %d (arrived too late)", sched.Index)
 				return
 			}
@@ -984,7 +987,13 @@ func (r *RCD) handleMessage(data []byte) {
 			bf := bloom.FromBytes(bfPayload)
 			if bf != nil {
 				targetSlot := receivedMessage.Slot - r.disclosureDelay
-				msgs := r.getUnverifiedMessages(targetSlot)
+				
+				// --- FIX 3: Jitter-Resistant Verification Window ---
+				// Because data and flushes run asynchronously, packets often straddle slot boundaries.
+				var msgs [][]byte
+				msgs = append(msgs, r.getUnverifiedMessages(targetSlot-1)...)
+				msgs = append(msgs, r.getUnverifiedMessages(targetSlot)...)
+				msgs = append(msgs, r.getUnverifiedMessages(targetSlot+1)...)
 
 				verifiedCount := 0
 				for _, m := range msgs {
@@ -993,7 +1002,11 @@ func (r *RCD) handleMessage(data []byte) {
 					}
 				}
 				log.Printf("[SUCCESS] Prob-Adaptive Batch Verification: %d messages authenticated for slot %d (T_i: %dms)", verifiedCount, targetSlot, sched.Duration)
+				
+				// Cleanup the window
+				r.unverifiedMsgs.Delete(targetSlot - 1)
 				r.unverifiedMsgs.Delete(targetSlot)
+				r.unverifiedMsgs.Delete(targetSlot + 1)
 			}
 		default:
 			log.Printf("[SUCCESS] Verified message from %s: %s", receivedMessage.SenderID, string(payload))
@@ -1080,9 +1093,19 @@ func (r *RCD) calculateHMAC(key, data []byte) []byte {
 }
 
 func (r *RCD) calculateTimeCongestion() float64 {
-	queueLen := float64(len(r.disclosureMessages))
-	queueCap := 1024.0
+	// --- THE TRUE QUEUE ---
+	// Because hardware is blocking the flushes, the backpressure 
+	// forces packets to pile up in the ingest buffer!
+	r.bufferMutex.Lock()
+	queueLen := float64(len(r.messageBuffer))
+	r.bufferMutex.Unlock()
+	
+	// A backlog of 10 packets means the memory is 100% strained.
+	queueCap := 10.0 
 	disclosureQueue := queueLen / queueCap
+	if disclosureQueue > 1.0 {
+		disclosureQueue = 1.0
+	}
 
 	var avgLatNs float64
 	count := atomic.LoadInt64(&r.metrics.BroadcastCount)
@@ -1091,14 +1114,13 @@ func (r *RCD) calculateTimeCongestion() float64 {
 		avgLatNs = float64(dur) / float64(count)
 	}
 
-	broadcastLatency := (avgLatNs / 1e6) / 20.0 // 20.0ms baseline
+	broadcastLatency := (avgLatNs / 1e6) / 20.0 
 	if broadcastLatency > 1.0 {
-		broadcastLatency = 1.0 // Clamped to 1.0 maximum
+		broadcastLatency = 1.0 
 	}
 
-	// Default Weights
-	wDisc := 0.70
-	wLat := 0.30
+	wDisc := 0.30
+	wLat := 0.70
 
 	return (wDisc * disclosureQueue) + (wLat * broadcastLatency)
 }

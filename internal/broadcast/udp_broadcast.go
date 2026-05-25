@@ -5,6 +5,9 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"time"
+
+	"golang.org/x/time/rate" // Added for Hardware Emulation
 )
 
 // UDPConfig holds configuration for UDP broadcasting
@@ -19,15 +22,18 @@ func DefaultUDPConfig() UDPConfig {
 	return UDPConfig{
 		BroadcastAddr: "255.255.255.255:8888",
 		ListenAddr:    ":8888",
-		BufferSize:    1024,
+		// BufferSize:    1024,
+		// Reduced to mimic ESP32 type devices
+		BufferSize: 4096,
 	}
 }
 
 // UDPBroadcaster implements the Broadcaster interface using UDP
 type UDPBroadcaster struct {
-	conn *net.UDPConn
-	addr *net.UDPAddr
-	mu   sync.Mutex
+	conn    *net.UDPConn
+	addr    *net.UDPAddr
+	mu      sync.Mutex
+	limiter *rate.Limiter // Added to enforce physical baud rate constraints
 }
 
 // NewUDPBroadcaster creates a new UDP broadcaster
@@ -49,9 +55,17 @@ func NewUDPBroadcaster(config UDPConfig) (*UDPBroadcaster, error) {
 		return nil, err
 	}
 
+	// -------------------------------------------------------------
+	// HARDWARE EMULATION:
+	// Simulate an ESP32/Zigbee radio strictly limited to ~1.6 kbps (200 bytes/sec).
+	// This acts as a physical hardware bottleneck.
+	// -------------------------------------------------------------
+	bytesPerSecond := 100
+	limiter := rate.NewLimiter(rate.Limit(bytesPerSecond), 8192)
 	return &UDPBroadcaster{
-		conn: conn,
-		addr: addr,
+		conn:    conn,
+		addr:    addr,
+		limiter: limiter,
 	}, nil
 }
 
@@ -67,6 +81,10 @@ func (b *UDPBroadcaster) Broadcast(ctx context.Context, data []byte) error {
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	baudRateBytesPerSec := 50
+	transmissionTime := time.Duration(len(data)) * time.Second / time.Duration(baudRateBytesPerSec)
+	time.Sleep(transmissionTime)
 
 	_, err := b.conn.Write(data)
 	return err

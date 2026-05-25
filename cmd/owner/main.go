@@ -23,7 +23,7 @@ func main() {
 	mode := flag.String("mode", "deterministic", "Operational mode: deterministic, probabilistic, adaptive, probadaptive")
 	tMin := flag.Uint64("t-min", 1000, "Minimum slot duration in ms (Adaptive Mode)")
 	tMax := flag.Uint64("t-max", 10000, "Maximum slot duration in ms (Adaptive Mode)")
-	numRCDs := flag.Int("num-rcds", 40, "Number of RCD UUIDs to generate on startup")
+	numRCDs := flag.Int("num-rcds", 110, "Number of RCD UUIDs to generate on startup")
 
 	flag.Parse()
 

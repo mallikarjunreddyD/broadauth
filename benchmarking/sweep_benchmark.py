@@ -10,15 +10,14 @@ from typing import List, Dict
 # --- CONFIGURATION ---
 SWEEP_DIR = "benchmarks/sweep"
 RESULTS_FILE = f"{SWEEP_DIR}/sweep_results.json"
-DURATION = 90  # Seconds per phase
-LOSS_RATES = [0, 10, 20, 40, 60, 80, 100]
+DURATION = 120 
+LOSS_RATES = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100] 
+ITERATIONS = 10 
 
 # Binaries & Shared Arguments
 RCD_BIN = "./bin/rcd"
 OWNER_BIN = "./bin/owner"
 ETH_URL = "http://0.0.0.0:8545"
-
-# !!! ENSURE THIS IS YOUR CORRECT FORGE DEPLOYMENT ADDRESS !!!
 CONTRACT_ADDR = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
 
 OWNER_ADDR = "0.0.0.0:10102"
@@ -30,6 +29,7 @@ DISCLOSURE_DELAY = "2"
 
 # Regex Parsers
 RE_DI = re.compile(r"D_i \(Queue\): ([\d\.]+)")
+RE_BI = re.compile(r"B_i \(Latency\): ([\d\.]+)")
 RE_TOGGLE = re.compile(r"Scaling T_i: \d+ms -> (\d+)ms")
 RE_BATCH = re.compile(r"Batch of (\d+) packets")
 RE_DROP = re.compile(r"\[SECURITY\] Dropped")
@@ -39,7 +39,6 @@ RE_SUCCESS = re.compile(r"\[SUCCESS\] Prob-Adaptive Batch Verification")
 def setup_directories():
     if not os.path.exists(SWEEP_DIR):
         os.makedirs(SWEEP_DIR)
-    # Ensure network is clean before starting
     subprocess.run("tc qdisc del dev lo root", shell=True, stderr=subprocess.DEVNULL)
 
 
@@ -78,7 +77,8 @@ def get_uuids_from_owner(owner_proc: subprocess.Popen[str], count: int) -> List[
     owner_log_file = open(f"{SWEEP_DIR}/owner.log", "w")
 
     start_time = time.time()
-    while time.time() - start_time < 20:
+    # Increased timeout to allow generating 70 UUIDs safely
+    while time.time() - start_time < 60:
         if owner_proc.stdout is None:
             break
         line = owner_proc.stdout.readline()
@@ -113,37 +113,30 @@ def get_uuids_from_owner(owner_proc: subprocess.Popen[str], count: int) -> List[
 
 
 def apply_network_chaos(loss: int):
-    """
-    Applies tc rules ONLY to UDP traffic (protocol 17).
-    TCP traffic (Anvil RPC) remains unthrottled to prevent blockchain disconnects!
-    """
     subprocess.run("tc qdisc del dev lo root", shell=True, stderr=subprocess.DEVNULL)
     if loss > 0:
-        # 1. Create a priority queue at the root
         subprocess.run(
             "tc qdisc add dev lo root handle 1: prio", shell=True, check=True
         )
-        # 2. Add the netem delay/drop rule to band 1 (flowid 1:1)
-        subprocess.run(
-            f"tc qdisc add dev lo parent 1:1 handle 10: netem delay 100ms drop {loss}%",
-            shell=True,
-            check=True,
-        )
-        # 3. Filter UDP traffic (protocol 17) to go through the throttled band 1
+        tc_cmd = f"tc qdisc add dev lo parent 1:1 handle 10: netem drop {loss}%"
+        subprocess.run(tc_cmd, shell=True, check=True)
         subprocess.run(
             "tc filter add dev lo protocol ip parent 1:0 u32 match ip protocol 17 0xff flowid 1:1",
             shell=True,
             check=True,
         )
-        print(f"[*] Applied Selective UDP Throttle: 100ms delay, {loss}% packet drop")
+        print(
+            f"    [+] Applied Selective UDP Throttle: Pure {loss}% packet drop pipeline"
+        )
     else:
-        print("[*] Network is clean (0% drop)")
+        print("    [+] Network is clean (0% drop)")
 
 
 def parse_sweep_log(filepath: str) -> Dict:
     current_t = 1000
     t_history = []
     di_history = []
+    bi_history = []
     batch_sizes = []
     drops = 0
     successes = 0
@@ -154,6 +147,10 @@ def parse_sweep_log(filepath: str) -> Dict:
             if di_match:
                 di_history.append(float(di_match.group(1)))
                 t_history.append(current_t)
+
+            bi_match = RE_BI.search(line)
+            if bi_match:
+                bi_history.append(float(bi_match.group(1)))
 
             toggle_match = RE_TOGGLE.search(line)
             if toggle_match:
@@ -171,6 +168,7 @@ def parse_sweep_log(filepath: str) -> Dict:
     return {
         "avg_t_ms": sum(t_history) / len(t_history) if t_history else 1000,
         "peak_di": max(di_history) if di_history else 0.0,
+        "peak_bi": max(bi_history) if bi_history else 0.0,
         "avg_batch_size": sum(batch_sizes) / len(batch_sizes) if batch_sizes else 0,
         "security_drops": drops,
         "verified_batches": successes,
@@ -186,78 +184,109 @@ def main():
 
     setup_directories()
     results = {}
-
     owner_proc = start_owner()
 
     try:
-        uuids = get_uuids_from_owner(owner_proc, len(LOSS_RATES))
+        total_runs = len(LOSS_RATES) * ITERATIONS
+        uuids = get_uuids_from_owner(owner_proc, total_runs)
 
-        if len(uuids) < len(LOSS_RATES):
+        if len(uuids) < total_runs:
             print("[!] Not enough UUIDs generated. Exiting.")
             sys.exit(1)
 
-        for i, loss in enumerate(LOSS_RATES):
-            uid = uuids[i]
+        uuid_index = 0
+
+        for loss in LOSS_RATES:
             print(f"\n========================================")
-            print(f"      PHASE: {loss}% PACKET LOSS")
+            print(f"  PHASE: {loss}% PACKET LOSS ({ITERATIONS} Trials)")
             print(f"========================================")
 
-            # Ensure network is clean for RCD boot-up
-            subprocess.run(
-                "tc qdisc del dev lo root", shell=True, stderr=subprocess.DEVNULL
-            )
+            phase_metrics = {
+                "avg_t_ms": [],
+                "peak_di": [],
+                "peak_bi": [],
+                "avg_batch_size": [],
+                "security_drops": [],
+                "verified_batches": [],
+            }
 
-            log_file = f"{SWEEP_DIR}/probadaptive_loss_{loss}.log"
-            print(f"[*] Booting RCD with UUID: {uid}")
+            for run in range(ITERATIONS):
+                uid = uuids[uuid_index]
+                uuid_index += 1
 
-            with open(log_file, "w") as f:
-                rcd_proc = subprocess.Popen(
-                    [
-                        RCD_BIN,
-                        "-contract",
-                        CONTRACT_ADDR,
-                        "-eth-url",
-                        ETH_URL,
-                        "-hashchain-len",
-                        HASHCHAIN_LEN,
-                        "-owner-addr",
-                        OWNER_ADDR,
-                        "-uuid",
-                        uid,
-                        "-mode",
-                        "probadaptive",
-                        "-t-min",
-                        "1000",
-                        "-t-max",
-                        "8000",
-                        "-disclosure-delay",
-                        DISCLOSURE_DELAY,
-                    ],
-                    stdout=f,
-                    stderr=subprocess.STDOUT,
+                print(f"  [*] Trial {run + 1}/{ITERATIONS} (UUID: {uid})")
+                subprocess.run(
+                    "tc qdisc del dev lo root", shell=True, stderr=subprocess.DEVNULL
                 )
 
-                print("[*] Waiting 5 seconds for RCD to fetch initial hashchain...")
-                time.sleep(5)
+                log_file = f"{SWEEP_DIR}/probadaptive_loss_{loss}_run_{run + 1}.log"
 
-                # Now apply the UDP chaos!
-                apply_network_chaos(loss)
-                print(f"[*] Running protocol simulation for {DURATION - 5}s...")
+                with open(log_file, "w") as f:
+                    rcd_proc = subprocess.Popen(
+                        [
+                            RCD_BIN,
+                            "-contract",
+                            CONTRACT_ADDR,
+                            "-eth-url",
+                            ETH_URL,
+                            "-hashchain-len",
+                            HASHCHAIN_LEN,
+                            "-owner-addr",
+                            OWNER_ADDR,
+                            "-uuid",
+                            uid,
+                            "-mode",
+                            "probadaptive",
+                            "-t-min",
+                            "1000",
+                            "-t-max",
+                            "8000",
+                            "-disclosure-delay",
+                            DISCLOSURE_DELAY,
+                            "-bench",
+                        ],
+                        stdout=f,
+                        stderr=subprocess.STDOUT,
+                    )
 
-                try:
-                    time.sleep(DURATION - 5)
-                except KeyboardInterrupt:
+                    time.sleep(5)  # Let RCD fetch hashchain
+                    apply_network_chaos(loss)
+
+                    try:
+                        time.sleep(DURATION - 5)
+                    except KeyboardInterrupt:
+                        rcd_proc.terminate()
+                        raise
+
                     rcd_proc.terminate()
-                    raise
+                    rcd_proc.wait()
 
-                rcd_proc.terminate()
-                rcd_proc.wait()
+                # Parse the individual run
+                metrics = parse_sweep_log(log_file)
+                for k in phase_metrics.keys():
+                    phase_metrics[k].append(metrics[k])
 
-            metrics = parse_sweep_log(log_file)
-            results[f"{loss}%"] = metrics
-            print(f"  -> Avg Slot Duration: {metrics['avg_t_ms']:.0f}ms")
-            print(f"  -> Peak Queue Pressure: {metrics['peak_di']:.2f}")
-            print(f"  -> Avg Batch Size: {metrics['avg_batch_size']:.1f} packets")
+            # Calculate mathematical averages for the phase
+            averaged_metrics = {
+                k: sum(v) / len(v) if len(v) > 0 else 0
+                for k, v in phase_metrics.items()
+            }
+            results[f"{loss}%"] = averaged_metrics
+
+            # Print aggregated phase summary
+            print(f"\n  [AGGREGATE SUMMARY: {loss}% LOSS]")
+            print(f"  -> Avg Slot Duration: {averaged_metrics['avg_t_ms']:.0f}ms")
+            print(f"  -> Avg Peak Queue Pressure: {averaged_metrics['peak_di']:.2f}")
+            print(f"  -> Avg Peak Latency: {averaged_metrics['peak_bi']:.2f}")
+            print(
+                f"  -> Avg Batch Size: {averaged_metrics['avg_batch_size']:.1f} packets"
+            )
+            print(
+                f"  -> Avg Authenticated Batches: {averaged_metrics['verified_batches']:.1f}"
+            )
+            print(
+                f"  -> Avg Prevented Forgeries: {averaged_metrics['security_drops']:.1f}"
+            )
 
         subprocess.run(
             "tc qdisc del dev lo root", shell=True, stderr=subprocess.DEVNULL
@@ -266,7 +295,7 @@ def main():
 
         with open(RESULTS_FILE, "w") as f:
             json.dump(results, f, indent=4)
-        print(f"[*] Sweep completed. Data saved to {RESULTS_FILE}")
+        print(f"[*] Full sweep completed. Aggregated data saved to {RESULTS_FILE}")
 
     finally:
         print("[*] Stopping Owner Node...")
