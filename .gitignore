@@ -5,3 +5,7 @@
 /results/
 /plots/
 /logs/
+/venv/
+/papers/
+/benchmarks/
+pyrightconfig.json
