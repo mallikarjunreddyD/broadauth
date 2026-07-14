@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/big"
 	"net"
 	"os"
@@ -35,6 +36,18 @@ const (
 	ModeProbabilistic
 )
 
+// Adaptive slot-timing controller constants (EIP-1559-style multiplicative
+// rule, see selectNextDuration).
+const (
+	targetUtilization = 0.5  // healthy disclosure queue = half full
+	adjustmentFactor  = 0.25 // caps a single step at +/-12.5% when Delta=+/-0.5
+)
+
+// networkDelaySlack is the delta_net term in Theorem 1's receiver wait bound
+// (d*Tmax + delta_net): slack added on top of the worst-case disclosure delay
+// to absorb ordinary network jitter between sender and receiver.
+const networkDelaySlack = 250 * time.Millisecond
+
 // Metrics holds atomic counters for benchmarking
 type Metrics struct {
 	BytesSent        uint64
@@ -50,6 +63,10 @@ type Metrics struct {
 	VerifyCount       int64
 	BroadcastDuration int64
 	BroadcastCount    int64
+
+	// Receiver-side verification outcomes (adaptive mode)
+	MessagesVerified         int64
+	MessagesDroppedPremature int64
 }
 
 type RCD struct {
@@ -68,9 +85,21 @@ type RCD struct {
 	receiver    broadcast.Receiver
 	slotSource  slot.SlotSource
 
+	// adaptiveSource is non-nil iff adaptive is true; it's the same object as
+	// slotSource, kept as a concrete type so the controller can call
+	// SetDuration/GetDuration without widening the shared SlotSource
+	// interface for every other slot source implementation.
+	adaptive       bool
+	tMin           uint64 // ms, immutable floor from the smart contract
+	tMax           uint64 // ms, immutable ceiling from the smart contract
+	messageRate    int    // packets/sec injected by the traffic generator
+	adaptiveSource *slot.AdaptiveSlotSource
+	startTime      time.Time
+
 	disclosureMessages chan DisclosurePayload
-	receivedHMACs      sync.Map
+	receivedHMACs      sync.Map // [32]byte -> time.Time (local receipt time)
 	commitmentKeys     sync.Map
+	senderTiming       sync.Map // uuid.UUID -> timingInfo, adaptive mode only
 
 	// Buffer for Probabilistic Mode Receiver: Map[Slot] -> List of Data Messages
 	unverifiedMsgs sync.Map
@@ -108,6 +137,23 @@ type Config struct {
 	SimulationTime     time.Duration
 	Mode               Mode
 	EnableBenchmarking bool
+
+	// Adaptive slot timing (Prob-Adaptive Inf-TESLA++). Adaptive is
+	// backward-compatible and defaults off: when false, TMin/TMax/MessageRate
+	// are ignored and the RCD behaves exactly like the fixed-slot baseline.
+	Adaptive    bool
+	TMin        uint64 // ms
+	TMax        uint64 // ms
+	MessageRate int    // packets/sec for the traffic generator
+}
+
+// timingInfo caches a sender's disclosure delay and Tmax, fetched once from
+// the smart contract via getAdaptiveKey and reused for every subsequent
+// wall-clock safety check on that sender's disclosures (see Theorem 1 check
+// in handleMessage).
+type timingInfo struct {
+	disclosureDelay uint64
+	tMax            uint64
 }
 
 func New(cfg Config) (*RCD, error) {
@@ -137,9 +183,17 @@ func New(cfg Config) (*RCD, error) {
 		return nil, fmt.Errorf("invalid hashchain length: must be between 1 and %d", 10*1024)
 	}
 
-	slotSource, err := slot.NewBeaconChainSlotSource(client, 3*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create slot source: %v", err)
+	var slotSource slot.SlotSource
+	var adaptiveSource *slot.AdaptiveSlotSource
+	if cfg.Adaptive {
+		adaptiveSource = slot.NewAdaptiveSlotSource(cfg.TMin)
+		slotSource = adaptiveSource
+	} else {
+		beaconSource, err := slot.NewBeaconChainSlotSource(client, 3*time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create slot source: %v", err)
+		}
+		slotSource = beaconSource
 	}
 
 	return &RCD{
@@ -153,6 +207,11 @@ func New(cfg Config) (*RCD, error) {
 		broadcaster:        broadcaster,
 		receiver:           receiver,
 		slotSource:         slotSource,
+		adaptive:           cfg.Adaptive,
+		tMin:               cfg.TMin,
+		tMax:               cfg.TMax,
+		messageRate:        cfg.MessageRate,
+		adaptiveSource:     adaptiveSource,
 		disclosureMessages: make(chan DisclosurePayload, 1024),
 		messageBuffer:      make([][]byte, 0),
 		mode:               cfg.Mode,
@@ -162,6 +221,7 @@ func New(cfg Config) (*RCD, error) {
 
 func (r *RCD) Start() error {
 	r.ctx, r.cancel = context.WithTimeout(context.Background(), r.simulationTime)
+	r.startTime = time.Now()
 
 	r.receiver.SetMessageHandler(r.handleMessage)
 	if err := r.receiver.Start(r.ctx); err != nil {
@@ -215,8 +275,8 @@ func (r *RCD) benchmarkWorker() {
 
 	startTime := time.Now()
 
-	fmt.Println("   Time |      Tx Rate      |      Rx Rate      |  Msg/s  | Mem(MB) | Total Overhead | Avg HMAC (µs) | Avg Verify (µs) | Avg Bcast (µs)")
-	fmt.Println("------------------------------------------------------------------------------------------------------------------------------------")
+	fmt.Println("   Time |      Tx Rate      |      Rx Rate      |  Msg/s  | Mem(MB) | Total Overhead | Avg HMAC (µs) | Avg Verify (µs) | Avg Bcast (µs) | Verified | PrematureDrop")
+	fmt.Println("---------------------------------------------------------------------------------------------------------------------------------------------------------------")
 
 	for {
 		select {
@@ -263,9 +323,12 @@ func (r *RCD) benchmarkWorker() {
 
 			elapsed := t.Sub(startTime).Seconds()
 
+			verified := atomic.LoadInt64(&r.metrics.MessagesVerified)
+			droppedPremature := atomic.LoadInt64(&r.metrics.MessagesDroppedPremature)
+
 			// Print to Stdout (visible even if log is discarded)
-			fmt.Printf("%7.1fs | %10.2f B/s | %10.2f B/s | %7.1f | %7.2f | %12d B | %12.2f | %14.2f | %13.2f\n",
-				elapsed, txRate, rxRate, msgRate, memUsage, overhead, avgHMAC, avgVerify, avgBroadcast)
+			fmt.Printf("%7.1fs | %10.2f B/s | %10.2f B/s | %7.1f | %7.2f | %12d B | %12.2f | %14.2f | %13.2f | %8d | %13d\n",
+				elapsed, txRate, rxRate, msgRate, memUsage, overhead, avgHMAC, avgVerify, avgBroadcast, verified, droppedPremature)
 
 			prevBytesSent = currBytesSent
 			prevBytesRecv = currBytesRecv
@@ -329,8 +392,14 @@ func (r *RCD) requestHashChainOnce(currentSlot uint64) error {
 
 func (r *RCD) broadcastLoop() {
 	defer r.wg.Done()
-	// High-speed traffic for benchmarking (approx 500 msgs/sec)
-	trafficTicker := time.NewTicker(2 * time.Second)
+	// Traffic generator: rate is configurable via Config.MessageRate so
+	// congestion-rate experiments (keychain lifespan vs. injection rate) are
+	// actually meaningful. Defaults to 1/sec if unset/invalid.
+	rate := r.messageRate
+	if rate <= 0 {
+		rate = 1
+	}
+	trafficTicker := time.NewTicker(time.Second / time.Duration(rate))
 	defer trafficTicker.Stop()
 	slotTicker := r.slotSource.Ticker(r.ctx)
 
@@ -351,8 +420,62 @@ func (r *RCD) broadcastLoop() {
 					log.Printf("Failed to flush batch for slot %d: %v", slotToFlush, err)
 				}
 			}(currentSlot - 1)
+
+			// Mode-agnostic: this fires every slot boundary regardless of
+			// Mode, since flushBatch above already runs unconditionally
+			// (it's a no-op on an empty buffer in deterministic mode).
+			if r.adaptive {
+				r.adjustSlotDuration()
+			}
 		}
 	}
+}
+
+// selectNextDuration implements the EIP-1559-style multiplicative control
+// rule from GUIDE.md: nudge the slot duration toward Tmax when the
+// disclosure queue is more than targetUtilization full, and toward Tmin when
+// it's less, clamped to [Tmin,Tmax].
+//
+// Qlen is the number of pending DisclosurePayload entries currently sitting
+// in the disclosure queue (len(disclosureMessages)); Qcap is that queue's
+// total capacity (cap(disclosureMessages)). One "disclosure event" is a
+// single DisclosurePayload: the (key, evidence, targetSlot) bundle produced
+// once per flush and held until the mandatory d-slot delay elapses.
+func selectNextDuration(qlen, qcap int, tCur, tMin, tMax uint64) uint64 {
+	if qcap <= 0 {
+		return tCur
+	}
+	uCur := float64(qlen) / float64(qcap)
+	delta := uCur - targetUtilization
+	tNext := float64(tCur) * (1 + adjustmentFactor*delta)
+
+	next := uint64(math.Round(tNext))
+	if next < tMin {
+		next = tMin
+	}
+	if next > tMax {
+		next = tMax
+	}
+	return next
+}
+
+// adjustSlotDuration samples the current disclosure queue and re-arms the
+// adaptive slot timer with the next duration. Logged via fmt.Printf (not
+// log.Printf) so the line survives benchmarking mode, where log output is
+// discarded but stdout is captured by the harness.
+func (r *RCD) adjustSlotDuration() {
+	qlen := len(r.disclosureMessages)
+	qcap := cap(r.disclosureMessages)
+	tCur := r.adaptiveSource.GetDuration()
+	tNext := selectNextDuration(qlen, qcap, tCur, r.tMin, r.tMax)
+	r.adaptiveSource.SetDuration(tNext)
+
+	uCur := 0.0
+	if qcap > 0 {
+		uCur = float64(qlen) / float64(qcap)
+	}
+	fmt.Printf("[PROB-ADAPTIVE] t=%.3fs T_cur=%dms U_cur=%.2f Qlen=%d Qcap=%d T_next=%dms\n",
+		time.Since(r.startTime).Seconds(), tCur, uCur, qlen, qcap, tNext)
 }
 
 func (r *RCD) CurrentSlotKey() (slot.Slot, []byte, error) {
@@ -361,6 +484,13 @@ func (r *RCD) CurrentSlotKey() (slot.Slot, []byte, error) {
 
 	for {
 		if r.hashChain == nil || r.cachedKeySlot == 0 {
+			// r.hashChain == nil only at startup (first fill); cachedKeySlot
+			// dropping to 0 after a chain was in use means it was walked off
+			// the end, i.e. genuine exhaustion. fmt.Printf (not log.Printf)
+			// so this survives benchmarking mode's log-discard.
+			if r.hashChain != nil {
+				fmt.Printf("[KEYCHAIN] exhausted after %.3fs, refilling\n", time.Since(r.startTime).Seconds())
+			}
 			log.Printf("Hashchain exhausted or missing, refilling...")
 			hashchainBeginSlot, err := r.slotSource.GetSlot()
 			if err != nil {
@@ -671,10 +801,18 @@ func (r *RCD) handleMessage(data []byte) {
 	}
 
 	if receivedMessage.Kind == message.MessageKindData {
-		securityCutoff := receivedMessage.Slot + r.disclosureDelay
-		if currentSlot >= securityCutoff {
-			log.Printf("[SECURITY] Dropped message for slot %d (arrived too late)", receivedMessage.Slot)
-			return
+		// This slot-count check is only meaningful when currentSlot and
+		// receivedMessage.Slot are drawn from the same globally-synchronized
+		// clock (the fixed-slot baseline). Under adaptive mode each process
+		// free-runs its own AdaptiveSlotSource, so the two counters are not
+		// comparable; the equivalent safety property is instead enforced
+		// as a wall-clock check on key disclosure, below (Theorem 1).
+		if !r.adaptive {
+			securityCutoff := receivedMessage.Slot + r.disclosureDelay
+			if currentSlot >= securityCutoff {
+				log.Printf("[SECURITY] Dropped message for slot %d (arrived too late)", receivedMessage.Slot)
+				return
+			}
 		}
 		r.storeUnverifiedMessage(receivedMessage.Slot, receivedMessage.Data)
 		return
@@ -693,9 +831,31 @@ func (r *RCD) handleMessage(data []byte) {
 			atomic.AddInt64(&r.metrics.HMACCount, 1)
 		}
 
-		if _, exists := r.receivedHMACs.LoadAndDelete(hmacArray); !exists {
+		hmacReceivedAtVal, exists := r.receivedHMACs.LoadAndDelete(hmacArray)
+		if !exists {
 			log.Printf("No matching HMAC found for key disclosure from %s", receivedMessage.SenderID)
 			return
+		}
+
+		// Theorem 1 (Timing Safety): don't trust a disclosed key until our
+		// own local wall-clock stopwatch, started when we first saw this
+		// slot's committed HMAC, shows at least d*Tmax + network_delay_slack
+		// elapsed. Tmax comes from the smart contract, never from the
+		// sender's live timing.
+		if r.adaptive {
+			timing, err := r.getSenderTiming(receivedMessage.SenderID)
+			if err != nil {
+				log.Printf("[SECURITY] Could not fetch timing policy for %s, rejecting disclosure: %v", receivedMessage.SenderID, err)
+				atomic.AddInt64(&r.metrics.MessagesDroppedPremature, 1)
+				return
+			}
+			minWait := time.Duration(timing.disclosureDelay*timing.tMax)*time.Millisecond + networkDelaySlack
+			elapsed := time.Since(hmacReceivedAtVal.(time.Time))
+			if elapsed < minWait {
+				log.Printf("[SECURITY] Rejected premature key disclosure from %s (waited %s, need >= %s)", receivedMessage.SenderID, elapsed, minWait)
+				atomic.AddInt64(&r.metrics.MessagesDroppedPremature, 1)
+				return
+			}
 		}
 
 		startVerify := time.Now()
@@ -724,18 +884,20 @@ func (r *RCD) handleMessage(data []byte) {
 					}
 				}
 				log.Printf("Probabilistic Batch Verification: %d messages authenticated for slot %d", verifiedCount, targetSlot)
+				atomic.AddInt64(&r.metrics.MessagesVerified, int64(verifiedCount))
 				r.unverifiedMsgs.Delete(targetSlot)
 			}
 		} else {
 			// Deterministic mode: Payload IS the message
 			log.Printf("[SUCCESS] Verified message from %s: %s", receivedMessage.SenderID, string(payload))
+			atomic.AddInt64(&r.metrics.MessagesVerified, 1)
 		}
 	} else {
 		// HMAC Message
 		log.Printf("Received HMAC message from %s for slot %d", receivedMessage.SenderID, receivedMessage.Slot)
 		var hmacArray [32]byte
 		copy(hmacArray[:], receivedMessage.Data)
-		r.receivedHMACs.Store(hmacArray, true)
+		r.receivedHMACs.Store(hmacArray, time.Now())
 	}
 }
 
@@ -754,15 +916,49 @@ func (r *RCD) getUnverifiedMessages(slot uint64) [][]byte {
 	return value.([][]byte)
 }
 
+// getSenderTiming lazily fetches and caches a sender's disclosure delay and
+// Tmax from the smart contract via getAdaptiveKey. Also opportunistically
+// caches the commitment key returned in the same call, so verifyKey's own
+// lookup below normally finds it without a second contract round-trip.
+func (r *RCD) getSenderTiming(senderID uuid.UUID) (timingInfo, error) {
+	if v, ok := r.senderTiming.Load(senderID); ok {
+		return v.(timingInfo), nil
+	}
+
+	contractKey, _, _, delay, _, tMax, err := r.contract.GetAdaptiveKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
+	if err != nil {
+		return timingInfo{}, fmt.Errorf("failed to fetch adaptive key: %v", err)
+	}
+
+	info := timingInfo{disclosureDelay: delay.Uint64(), tMax: tMax.Uint64()}
+	r.senderTiming.Store(senderID, info)
+
+	if len(contractKey) > 0 {
+		if _, exists := r.commitmentKeys.Load(senderID); !exists {
+			r.commitmentKeys.Store(senderID, []byte(contractKey))
+		}
+	}
+
+	return info, nil
+}
+
 func (r *RCD) verifyKey(senderID uuid.UUID, key []byte) bool {
 	commitmentKey, ok := r.commitmentKeys.Load(senderID)
 	if !ok {
-		contractKey, _, _, _, err := r.contract.GetKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
-		if err != nil || len(contractKey) == 0 {
-			// Log error via wrapping if we were returning, but here we just return bool
-			return false
+		if r.adaptive {
+			contractKey, _, _, _, _, _, err := r.contract.GetAdaptiveKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
+			if err != nil || len(contractKey) == 0 {
+				return false
+			}
+			commitmentKey = []byte(contractKey)
+		} else {
+			contractKey, _, _, _, err := r.contract.GetKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
+			if err != nil || len(contractKey) == 0 {
+				// Log error via wrapping if we were returning, but here we just return bool
+				return false
+			}
+			commitmentKey = []byte(contractKey)
 		}
-		commitmentKey = []byte(contractKey)
 		r.commitmentKeys.Store(senderID, commitmentKey)
 	}
 

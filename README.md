@@ -83,3 +83,5 @@ cd ..
     -owner-addr 0.0.0.0:10102 \
     -uuid 8bfe24ae-d641-4522-ba83-3eab387a8fb3
 ```
+
+claude --resume 7023af2a-4d18-4481-b677-bb311a6969f1

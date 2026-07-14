@@ -1,0 +1,88 @@
+Here's the full command reference, in the order you'd actually run them.
+
+  1. Build
+
+  cd /home/vedant/Acad/Honours/broadauth
+  make                    # builds bin/cm, bin/cmtest, bin/owner, bin/rcd
+
+  2. Unit / contract-level verification (fast, no network needed)
+
+  # Go: EIP-1559 controller formula
+  go test ./internal/rcd/... -run TestSelectNextDuration -v
+  go test ./internal/rcd/... -v                    # full rcd package suite
+
+  # Solidity: storeAdaptiveKey/getAdaptiveKey
+  cd contracts && forge test --match-contract InfTESLAPlusPlusTest -vv && cd ..
+
+  3. Manual end-to-end smoke test (single node, ~1 minute)
+
+  # Terminal 1: local chain
+  anvil --block-time 12 --host 0.0.0.0 --port 8545
+
+  # Terminal 2: deploy + consortium manager
+  cd contracts
+  forge create src/InfTESLAPlusPlus.sol:InfTESLAplusplus \
+    --rpc-url 0.0.0.0:8545 \
+    --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+    --broadcast
+  cd ..
+  # note the "Deployed to:" address (deterministic on a fresh anvil: 0x5FbDB2315678afecb367f032d93F642f64180aa3)
+
+  ./bin/cm -eth-url http://0.0.0.0:8545 \
+    -contract 0x5FbDB2315678afecb367f032d93F642f64180aa3 \
+    -private-key ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
+    -port 10101
+
+  # Terminal 3: owner (adaptive)
+  ./bin/owner -eth-url http://0.0.0.0:8545 \
+    -contract 0x5FbDB2315678afecb367f032d93F642f64180aa3 \
+    -private-key 59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d \
+    -cm-addr 0.0.0.0:10101 -disclosure-delay 2 -hashchain-len 32 -port 10102 \
+    -adaptive -tmin 1000 -tmax 8000
+  # prints 20 UUIDs (or -num-rcds N) - copy one
+
+  # Terminal 4: RCD (use a fresh, never-used UUID each time)
+  ./bin/rcd -contract 0x5FbDB2315678afecb367f032d93F642f64180aa3 \
+    -disclosure-delay 2 -eth-url http://0.0.0.0:8545 -hashchain-len 32 \
+    -owner-addr 0.0.0.0:10102 -uuid <UUID-from-owner> \
+    -mode probabilistic -adaptive -tmin 1000 -tmax 8000 -msg-rate 50 \
+    -simulation-time 30s
+  Watch for [PROB-ADAPTIVE] T_cur=..., [KEYCHAIN] exhausted after ... (only if you let -simulation-time run long enough), and [SECURITY] Rejected premature key
+  disclosure lines. Kill terminals 1–3 (Ctrl+C) when done, or pkill anvil; pkill -f bin/owner; pkill -f bin/cm.
+
+  4. Full benchmark sweep
+
+  Each of these starts and stops its own anvil/cm/owner — don't leave the manual ones from step 3 running.
+
+  source venv/bin/activate
+  cd benchmarking
+
+  # Original baseline det-vs-prob comparison (~1hr: 20 runs x 175s)
+  python benchmark.py --experiment baseline
+
+  # Chart 1: keychain lifespan vs. injection rate, 4-way (~20min: 20 runs x 60s)
+  python benchmark.py --experiment lifespan
+
+  # Chart 2: throughput vs. bandwidth, 4-way - needs tc, so needs root (~18min: 24 runs x 45s)
+  sudo $(which python) benchmark.py --experiment bandwidth
+
+  # Step-response time series - also needs tc (~90s)
+  sudo $(which python) benchmark.py --experiment step
+
+  # Or all four in one go (still needs root for bandwidth/step to actually apply the tc cap;
+  # without root they'll just print a warning and skip the cap, not crash)
+  sudo $(which python) benchmark.py --experiment all
+  Note: anvil from step 3 must not still be running (OWNER_PORT/CM_ADDR/ETH_URL are hardcoded to the same ports) — kill it first, benchmark.py doesn't start its
+  own anvil/cm, only the owner. You'll need anvil and cm up (steps 1–2 of section 3) before running any benchmark.py command.
+
+  5. Render charts
+
+  python generate_charts.py   # still inside benchmarking/, venv active
+  Output goes to plots/*.png — keychain_lifespan.png, throughput_vs_bandwidth.png, step_response.png, receiver_verification_outcomes.png, plus the 6 baseline
+  charts.
+
+  6. Cleanup between runs
+
+  pkill anvil; pkill -f bin/owner; pkill -f bin/cm; pkill -f bin/rcd
+  sudo tc qdisc del dev lo root 2>/dev/null   # in case a bandwidth cap was left applied
+  rm -rf benchmarks/ plots/                    # if you want a clean slate (both gitignored

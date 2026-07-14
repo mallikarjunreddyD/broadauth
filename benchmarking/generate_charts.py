@@ -1,604 +1,324 @@
+import glob
+import json
+import os
+from statistics import mean
+from typing import Dict, List, Optional
+
 import matplotlib.pyplot as plt  # type: ignore
 import numpy as np  # type: ignore
-import os
-from typing import List, Dict
 
-# ---------------------------------------------------------
-# 1. DATA PREPARATION
-# ---------------------------------------------------------
+from benchmark import (  # type: ignore
+    BANDWIDTH_CAPS_KBPS,
+    BENCH_DIR,
+    EXPERIMENT_CONFIGS,
+    LIFESPAN_RATES,
+    parse_log_file,
+)
 
-# Time steps (X-axis)
-time_steps = [
-    5.0,
-    10.0,
-    15.0,
-    20.0,
-    25.0,
-    30.0,
-    35.0,
-    40.0,
-    45.0,
-    50.0,
-    55.0,
-    60.0,
-    65.0,
-    70.0,
-    75.0,
-    80.0,
-    85.0,
-    90.0,
-    95.0,
-    100.0,
-    105.0,
-    110.0,
-    115.0,
-    120.0,
-    125.0,
-    130.0,
-    135.0,
-    140.0,
-    145.0,
-    150.0,
-    155.0,
-    160.0,
-    165.0,
-    170.0,
-]
-
-# DETERMINISTIC MODE DATA
-det_data: Dict[str, List[float]] = {
-    "Tx Rate": [
-        0,
-        0,
-        2718,
-        14517,
-        23050,
-        27125,
-        26026,
-        31464,
-        40315,
-        30431,
-        38153,
-        33860,
-        34965,
-        34672,
-        29478,
-        37034,
-        29597,
-        32573,
-        31564,
-        32260,
-        38546,
-        31447,
-        33738,
-        29027,
-        34546,
-        36338,
-        32977,
-        39890,
-        32769,
-        32938,
-        34222,
-        33202,
-        40869,
-        32472,
-    ],
-    "Rx Rate": [
-        0,
-        0,
-        2711,
-        14508,
-        23048,
-        27123,
-        26026,
-        29832,
-        33179,
-        27129,
-        30403,
-        29542,
-        28761,
-        29884,
-        27288,
-        30499,
-        28047,
-        28207,
-        27231,
-        27750,
-        31898,
-        29348,
-        28833,
-        25895,
-        29921,
-        31339,
-        30536,
-        33207,
-        30733,
-        27706,
-        29255,
-        29059,
-        33891,
-        29756,
-    ],
-    "Msg/s": [
-        0,
-        0,
-        9.8,
-        52.2,
-        82.7,
-        96.8,
-        92.4,
-        93.9,
-        68.1,
-        72.4,
-        56.3,
-        76.7,
-        60.3,
-        71.8,
-        79.8,
-        64.3,
-        82.4,
-        66.0,
-        59.1,
-        64.7,
-        63.7,
-        82.5,
-        68.1,
-        70.3,
-        66.0,
-        69.9,
-        87.8,
-        66.5,
-        93.9,
-        63.6,
-        64.6,
-        73.5,
-        66.9,
-        87.4,
-    ],
-    "Mem": [
-        0.84,
-        0.90,
-        1.19,
-        1.68,
-        2.04,
-        2.04,
-        2.18,
-        2.26,
-        2.39,
-        2.24,
-        2.37,
-        2.91,
-        2.58,
-        2.51,
-        2.92,
-        2.84,
-        2.97,
-        3.09,
-        3.04,
-        3.00,
-        3.25,
-        3.56,
-        3.49,
-        3.52,
-        3.67,
-        3.87,
-        3.60,
-        3.69,
-        4.27,
-        4.04,
-        4.25,
-        4.09,
-        4.18,
-        4.74,
-    ],
-    "Overhead": [
-        0,
-        0,
-        6112,
-        38728,
-        90495,
-        151059,
-        208871,
-        292410,
-        440515,
-        535821,
-        682343,
-        791386,
-        918862,
-        1035838,
-        1120584,
-        1255213,
-        1338440,
-        1449449,
-        1560827,
-        1671309,
-        1814020,
-        1906430,
-        2021600,
-        2111492,
-        2232357,
-        2359181,
-        2455101,
-        2602336,
-        2692429,
-        2807154,
-        2927503,
-        3035755,
-        3187519,
-        3281223,
-    ],
-    "Bcast": [
-        0,
-        0,
-        958,
-        2644,
-        4697,
-        4468,
-        4720,
-        4512,
-        5262,
-        5622,
-        6288,
-        5398,
-        6044,
-        5361,
-        5322,
-        6792,
-        6288,
-        6363,
-        7709,
-        6220,
-        5588,
-        5133,
-        5982,
-        5877,
-        5965,
-        5296,
-        4875,
-        5146,
-        4679,
-        6842,
-        6591,
-        5977,
-        5553,
-        4956,
-    ],
-}
-
-# PROBABILISTIC MODE DATA
-prob_data: Dict[str, List[float]] = {
-    "Tx Rate": [
-        0,
-        0,
-        3911,
-        15195,
-        28098,
-        32495,
-        30274,
-        28701,
-        30783,
-        30927,
-        30903,
-        29813,
-        29529,
-        33735,
-        30288,
-        30761,
-        29943,
-        30738,
-        30858,
-        30479,
-        31289,
-        29610,
-        30028,
-        31594,
-        30153,
-        31469,
-        32269,
-        30383,
-        29728,
-        30600,
-        30966,
-        29507,
-        30468,
-        31342,
-    ],
-    "Rx Rate": [
-        0,
-        0,
-        3902,
-        15192,
-        28091,
-        32495,
-        30274,
-        28486,
-        30564,
-        30672,
-        30521,
-        29565,
-        29344,
-        33287,
-        30291,
-        30374,
-        29712,
-        30547,
-        30462,
-        30326,
-        31103,
-        29374,
-        29650,
-        31388,
-        29970,
-        31031,
-        32279,
-        30019,
-        29472,
-        30423,
-        30500,
-        29340,
-        30297,
-        31052,
-    ],
-    "Msg/s": [
-        0,
-        0,
-        25.3,
-        97.8,
-        180.0,
-        205.9,
-        191.3,
-        179.9,
-        193.1,
-        193.6,
-        192.6,
-        186.7,
-        185.4,
-        209.9,
-        191.7,
-        191.8,
-        187.6,
-        193.0,
-        191.8,
-        191.5,
-        196.4,
-        185.5,
-        187.0,
-        198.0,
-        189.4,
-        195.7,
-        204.2,
-        189.4,
-        186.1,
-        192.1,
-        192.5,
-        185.3,
-        191.4,
-        196.3,
-    ],
-    "Mem": [
-        0.86,
-        0.92,
-        1.19,
-        1.43,
-        2.26,
-        2.31,
-        2.06,
-        2.03,
-        2.67,
-        2.32,
-        2.44,
-        2.32,
-        2.63,
-        2.72,
-        2.72,
-        2.76,
-        3.11,
-        3.35,
-        3.28,
-        3.65,
-        3.30,
-        3.57,
-        3.90,
-        4.25,
-        4.11,
-        4.20,
-        4.43,
-        4.61,
-        4.50,
-        4.65,
-        4.96,
-        4.90,
-        5.39,
-        5.24,
-    ],
-    "Overhead": [
-        0,
-        0,
-        75,
-        208,
-        284,
-        363,
-        576,
-        1960,
-        3295,
-        4958,
-        7320,
-        8864,
-        10012,
-        12840,
-        12840,
-        15140,
-        16683,
-        17935,
-        20735,
-        21878,
-        23136,
-        24674,
-        27104,
-        28638,
-        29778,
-        32554,
-        32554,
-        34847,
-        36453,
-        37696,
-        40455,
-        41637,
-        42802,
-        44438,
-    ],
-    "Bcast": [
-        0,
-        0,
-        827,
-        1881,
-        3273,
-        3019,
-        3429,
-        3853,
-        3330,
-        3414,
-        3407,
-        3615,
-        3596,
-        2992,
-        3429,
-        3416,
-        3591,
-        3440,
-        3457,
-        3523,
-        3281,
-        3660,
-        3533,
-        3304,
-        3473,
-        3319,
-        3060,
-        3533,
-        3580,
-        3393,
-        3464,
-        3712,
-        3357,
-        3427,
-    ],
-}
-
-# Ensure plots directory exists
 output_dir = "plots"
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
 
 
-# Helper function to avoid repetition
-def save_chart(
+# ---------------------------------------------------------------------------
+# Shared plotting helpers
+# ---------------------------------------------------------------------------
+
+
+def save_line_chart(
     filename: str,
-    y_det: List[float],
-    y_prob: List[float],
+    series: Dict[str, List[float]],
+    x: List[float],
     title: str,
     y_label: str,
     x_label: str = "Time (s)",
     log_scale: bool = False,
-    is_line: bool = False,
 ) -> None:
     plt.figure(figsize=(10, 6))  # type: ignore
-
-    # X Positions for bar chart logic
-    x_indices = np.array(time_steps)  # type: ignore
-    bar_width = 2.0
-
-    if is_line:
-        plt.plot(x_indices, y_det, label="Deterministic", color="#1f77b4", marker="o", linewidth=2)  # type: ignore
-        plt.plot(x_indices, y_prob, label="Probabilistic", color="#ff7f0e", marker="s", linewidth=2)  # type: ignore
-    else:
-        plt.bar(x_indices - bar_width / 2, y_det, width=bar_width, label="Deterministic", color="#1f77b4", alpha=0.85)  # type: ignore
-        plt.bar(x_indices + bar_width / 2, y_prob, width=bar_width, label="Probabilistic", color="#ff7f0e", alpha=0.85)  # type: ignore
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+    markers = ["o", "s", "^", "d"]
+    for i, (label, y) in enumerate(series.items()):
+        plt.plot(x, y, label=label, color=colors[i % len(colors)], marker=markers[i % len(markers)], linewidth=2)  # type: ignore
 
     plt.title(title, fontsize=14, fontweight="bold", pad=15)  # type: ignore
     plt.xlabel(x_label, fontsize=12)  # type: ignore
     plt.ylabel(y_label, fontsize=12)  # type: ignore
     plt.grid(True, linestyle="--", alpha=0.5)  # type: ignore
     plt.legend(fontsize=10)  # type: ignore
-
     if log_scale:
         plt.yscale("log")  # type: ignore
 
-    # Save
     path = os.path.join(output_dir, filename)
     plt.savefig(path, dpi=300, bbox_inches="tight")  # type: ignore
     plt.close()  # type: ignore
     print(f"Saved: {path}")
 
 
-# ---------------------------------------------------------
-# 2. GENERATE INDIVIDUAL CHARTS
-# ---------------------------------------------------------
+def save_bar_chart(
+    filename: str,
+    series: Dict[str, List[float]],
+    x_labels: List[str],
+    title: str,
+    y_label: str,
+    x_label: str = "",
+) -> None:
+    plt.figure(figsize=(10, 6))  # type: ignore
+    n = len(series)
+    width = 0.8 / max(n, 1)
+    x_indices = np.arange(len(x_labels))  # type: ignore
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
 
-# 1. Throughput (Msg/s)
-save_chart(
-    "throughput.png",
-    det_data["Msg/s"],
-    prob_data["Msg/s"],
-    "Protocol Throughput (Messages per Second)",
-    "Messages / sec",
-)
+    for i, (label, y) in enumerate(series.items()):
+        offset = (i - (n - 1) / 2) * width
+        plt.bar(x_indices + offset, y, width=width, label=label, color=colors[i % len(colors)], alpha=0.85)  # type: ignore
 
-# 2. Bandwidth (Tx Rate)
-save_chart(
-    "bandwidth.png",
-    det_data["Tx Rate"],
-    prob_data["Tx Rate"],
-    "Bandwidth Usage (Tx Rate)",
-    "Bytes / sec",
-)
+    plt.xticks(x_indices, x_labels)  # type: ignore
+    plt.title(title, fontsize=14, fontweight="bold", pad=15)  # type: ignore
+    plt.xlabel(x_label, fontsize=12)  # type: ignore
+    plt.ylabel(y_label, fontsize=12)  # type: ignore
+    plt.grid(True, linestyle="--", alpha=0.5, axis="y")  # type: ignore
+    plt.legend(fontsize=10)  # type: ignore
 
-# 3. Protocol Overhead
-save_chart(
-    "overhead.png",
-    det_data["Overhead"],
-    prob_data["Overhead"],
-    "Cumulative Protocol Overhead (Bytes)",
-    "Bytes (Log Scale)",
-    log_scale=True,  # Use log scale because Deterministic is huge
-)
-
-# 4. Memory Usage
-save_chart(
-    "memory.png",
-    det_data["Mem"],
-    prob_data["Mem"],
-    "Memory Usage (Heap Allocation)",
-    "Megabytes (MB)",
-)
-
-# 5. Broadcast Latency
-save_chart(
-    "broadcast_latency.png",
-    det_data["Bcast"],
-    prob_data["Bcast"],
-    "Average Broadcast Latency (System Call)",
-    "Microseconds (µs)",
-)
+    path = os.path.join(output_dir, filename)
+    plt.savefig(path, dpi=300, bbox_inches="tight")  # type: ignore
+    plt.close()  # type: ignore
+    print(f"Saved: {path}")
 
 
-# 6. Efficiency Ratio (Line Chart)
-def safe_div(n: float, d: float) -> float:
-    return n / d if d > 0 else 0.0
+def load_and_average_runs(pattern: str) -> Dict[float, Dict[str, float]]:
+    """Average parse_log_file(...) across every log file matching a glob
+    pattern under BENCH_DIR (real parsed data, not hardcoded arrays)."""
+    files = sorted(glob.glob(os.path.join(BENCH_DIR, pattern)))
+    if not files:
+        return {}
+    runs = [parse_log_file(f) for f in files]
+    all_times: List[float] = sorted(set().union(*[r.keys() for r in runs]))
+    out: Dict[float, Dict[str, float]] = {}
+    for t in all_times:
+        vals = [r[t] for r in runs if t in r]
+        if not vals:
+            continue
+        out[t] = {k: mean(v[k] for v in vals) for k in vals[0].keys()}
+    return out
 
 
-eff_det = [
-    safe_div(m, t) * 1000 for m, t in zip(det_data["Msg/s"], det_data["Tx Rate"])
-]
-eff_prob = [
-    safe_div(m, t) * 1000 for m, t in zip(prob_data["Msg/s"], prob_data["Tx Rate"])
-]
+def load_json(filename: str) -> Optional[object]:
+    path = os.path.join(BENCH_DIR, filename)
+    if not os.path.exists(path):
+        print(f"[!] Missing {path}, skipping charts that depend on it.")
+        return None
+    with open(path) as f:
+        return json.load(f)
 
-save_chart(
-    "efficiency.png",
-    eff_det,
-    eff_prob,
-    "Protocol Efficiency (Messages delivered per KB)",
-    "Messages / KB",
-    is_line=True,
-)
+
+# ---------------------------------------------------------------------------
+# 1. Baseline deterministic vs. probabilistic charts (from real logs)
+# ---------------------------------------------------------------------------
+
+det_data = load_and_average_runs("run_*_deterministic_*.log")
+prob_data = load_and_average_runs("run_*_probabilistic_*.log")
+
+if det_data and prob_data:
+    times = sorted(set(det_data.keys()) & set(prob_data.keys()))
+    if times:
+        save_line_chart(
+            "throughput.png",
+            {
+                "Deterministic": [det_data[t]["msg_rate"] for t in times],
+                "Probabilistic": [prob_data[t]["msg_rate"] for t in times],
+            },
+            times,
+            "Protocol Throughput (Messages per Second)",
+            "Messages / sec",
+        )
+        save_line_chart(
+            "bandwidth.png",
+            {
+                "Deterministic": [det_data[t]["tx_rate"] for t in times],
+                "Probabilistic": [prob_data[t]["tx_rate"] for t in times],
+            },
+            times,
+            "Bandwidth Usage (Tx Rate)",
+            "Bytes / sec",
+        )
+        save_line_chart(
+            "overhead.png",
+            {
+                "Deterministic": [det_data[t]["overhead"] for t in times],
+                "Probabilistic": [prob_data[t]["overhead"] for t in times],
+            },
+            times,
+            "Cumulative Protocol Overhead (Bytes)",
+            "Bytes (Log Scale)",
+            log_scale=True,
+        )
+        save_line_chart(
+            "memory.png",
+            {
+                "Deterministic": [det_data[t]["mem"] for t in times],
+                "Probabilistic": [prob_data[t]["mem"] for t in times],
+            },
+            times,
+            "Memory Usage (Heap Allocation)",
+            "Megabytes (MB)",
+        )
+        save_line_chart(
+            "broadcast_latency.png",
+            {
+                "Deterministic": [det_data[t]["bcast_lat"] for t in times],
+                "Probabilistic": [prob_data[t]["bcast_lat"] for t in times],
+            },
+            times,
+            "Average Broadcast Latency (System Call)",
+            "Microseconds (µs)",
+        )
+
+        def safe_div(n: float, d: float) -> float:
+            return n / d if d > 0 else 0.0
+
+        save_line_chart(
+            "efficiency.png",
+            {
+                "Deterministic": [safe_div(det_data[t]["msg_rate"], det_data[t]["tx_rate"]) * 1000 for t in times],
+                "Probabilistic": [safe_div(prob_data[t]["msg_rate"], prob_data[t]["tx_rate"]) * 1000 for t in times],
+            },
+            times,
+            "Protocol Efficiency (Messages delivered per KB)",
+            "Messages / KB",
+        )
+else:
+    print("[!] No baseline run_*_deterministic_*/run_*_probabilistic_*.log files found under "
+          f"{BENCH_DIR}/ - run `python benchmark.py --experiment baseline` first.")
+
+
+# ---------------------------------------------------------------------------
+# 2. Chart 1: keychain lifespan vs. injected message rate
+# ---------------------------------------------------------------------------
+
+def _get_series(results: Dict[str, Dict[str, float]], label: str, keys: List) -> List[float]:
+    d = results.get(label, {})
+    return [d.get(str(k), d.get(k, 0.0)) for k in keys]
+
+
+lifespan_results = load_json("lifespan_results.json")
+if lifespan_results:
+    rates = LIFESPAN_RATES
+    series = {
+        "Deterministic (baseline)": _get_series(lifespan_results, "det-baseline", rates),  # type: ignore
+        "Deterministic (adaptive)": _get_series(lifespan_results, "det-adaptive", rates),  # type: ignore
+        "Probabilistic (baseline)": _get_series(lifespan_results, "prob-baseline", rates),  # type: ignore
+        "Probabilistic (adaptive)": _get_series(lifespan_results, "prob-adaptive", rates),  # type: ignore
+    }
+    save_line_chart(
+        "keychain_lifespan.png",
+        series,
+        rates,
+        "Keychain Lifespan vs. Injected Message Rate (Det/Prob x Baseline/Adaptive)",
+        "Time to first exhaustion (s)",
+        x_label="Injected message rate (packets/sec)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. Chart 2: throughput vs. emulated bandwidth
+# ---------------------------------------------------------------------------
+
+bandwidth_results = load_json("bandwidth_results.json")
+if bandwidth_results:
+    caps = BANDWIDTH_CAPS_KBPS
+    cap_labels = [f"{c}" if c > 0 else "uncapped" for c in caps]
+    series = {
+        "Deterministic (baseline)": _get_series(bandwidth_results, "det-baseline", caps),  # type: ignore
+        "Deterministic (adaptive)": _get_series(bandwidth_results, "det-adaptive", caps),  # type: ignore
+        "Probabilistic (baseline)": _get_series(bandwidth_results, "prob-baseline", caps),  # type: ignore
+        "Probabilistic (adaptive)": _get_series(bandwidth_results, "prob-adaptive", caps),  # type: ignore
+    }
+    plt.figure(figsize=(10, 6))  # type: ignore
+    colors = ["#1f77b4", "#aec7e8", "#ff7f0e", "#ffbb78"]
+    markers = ["o", "o", "s", "s"]
+    for i, (label, y) in enumerate(series.items()):
+        linestyle = "--" if "baseline" in label.lower() else "-"
+        plt.plot(range(len(caps)), y, label=label, color=colors[i], marker=markers[i], linestyle=linestyle, linewidth=2)  # type: ignore
+    plt.xticks(range(len(caps)), cap_labels)  # type: ignore
+    plt.title("Authenticated Data Throughput vs. Emulated Bandwidth (Det/Prob x Baseline/Adaptive)", fontsize=14, fontweight="bold", pad=15)  # type: ignore
+    plt.xlabel("Bandwidth cap (kbit/s)", fontsize=12)  # type: ignore
+    plt.ylabel("Avg Tx Rate (Bytes/sec)", fontsize=12)  # type: ignore
+    plt.grid(True, linestyle="--", alpha=0.5)  # type: ignore
+    plt.legend(fontsize=10)  # type: ignore
+    path = os.path.join(output_dir, "throughput_vs_bandwidth.png")
+    plt.savefig(path, dpi=300, bbox_inches="tight")  # type: ignore
+    plt.close()  # type: ignore
+    print(f"Saved: {path}")
+
+
+# ---------------------------------------------------------------------------
+# 4. Step-response: T_cur and queue utilization over time under an induced
+#    stress window. This is the one chart that shows the controller actually
+#    stretching under stress and recovering, not just bounded steady state.
+# ---------------------------------------------------------------------------
+
+step_ticks = load_json("step_response_ticks.json")
+if step_ticks:
+    ticks = step_ticks  # type: ignore
+    t = [tick["t"] for tick in ticks]  # type: ignore
+    t_cur = [tick["t_cur_ms"] for tick in ticks]  # type: ignore
+    u_cur = [tick["u_cur"] for tick in ticks]  # type: ignore
+
+    fig, ax1 = plt.subplots(figsize=(10, 6))  # type: ignore
+    ax1.plot(t, t_cur, color="#1f77b4", marker="o", markersize=3, linewidth=2, label="T_cur (ms)")  # type: ignore
+    ax1.set_xlabel("Time (s)", fontsize=12)  # type: ignore
+    ax1.set_ylabel("Slot duration T_cur (ms)", color="#1f77b4", fontsize=12)  # type: ignore
+    ax1.tick_params(axis="y", labelcolor="#1f77b4")  # type: ignore
+    ax1.grid(True, linestyle="--", alpha=0.5)  # type: ignore
+
+    ax2 = ax1.twinx()  # type: ignore
+    ax2.plot(t, u_cur, color="#d62728", marker="s", markersize=3, linewidth=2, label="U_cur (queue utilization)")  # type: ignore
+    ax2.set_ylabel("Queue utilization U_cur", color="#d62728", fontsize=12)  # type: ignore
+    ax2.tick_params(axis="y", labelcolor="#d62728")  # type: ignore
+    ax2.set_ylim(0, 1.05)  # type: ignore
+
+    plt.title("Step Response: T_cur and Queue Utilization Under Induced Stress", fontsize=14, fontweight="bold", pad=15)  # type: ignore
+    fig.tight_layout()  # type: ignore
+    path = os.path.join(output_dir, "step_response.png")
+    plt.savefig(path, dpi=300)  # type: ignore
+    plt.close()  # type: ignore
+    print(f"Saved: {path}")
+
+
+# ---------------------------------------------------------------------------
+# 5. Receiver-side chart: verified vs. premature-disclosure drops across the
+#    bandwidth sweep (reuses the bandwidth experiment's logs, no new runs).
+# ---------------------------------------------------------------------------
+
+if bandwidth_results:
+    caps = BANDWIDTH_CAPS_KBPS
+    # Receiver-side wall-clock rejections only exist under adaptive mode
+    # (non-adaptive uses the old slot-count check and never touches
+    # MessagesDroppedPremature), so this pulls specifically from the
+    # prob-adaptive runs of the bandwidth sweep.
+    verified: List[float] = []
+    dropped: List[float] = []
+    for c in caps:
+        files = sorted(glob.glob(os.path.join(BENCH_DIR, f"run_*_bandwidth_prob-adaptive_{c}kbps_*.log")))
+        if not files:
+            verified.append(0.0)
+            dropped.append(0.0)
+            continue
+        data = parse_log_file(files[0])
+        if not data:
+            verified.append(0.0)
+            dropped.append(0.0)
+            continue
+        last_t = max(data.keys())
+        verified.append(data[last_t]["verified"])
+        dropped.append(data[last_t]["dropped_premature"])
+
+    labels = [f"{c}" if c > 0 else "uncapped" for c in caps]
+    save_bar_chart(
+        "receiver_verification_outcomes.png",
+        {"Verified": verified, "Dropped (premature disclosure)": dropped},
+        labels,
+        "Receiver Verification Outcomes vs. Emulated Bandwidth (Probabilistic, Adaptive)",
+        "Messages",
+        x_label="Bandwidth cap (kbit/s)",
+    )

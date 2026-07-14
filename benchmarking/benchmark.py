@@ -1,3 +1,5 @@
+import argparse
+import json
 import subprocess
 import time
 
@@ -8,7 +10,7 @@ import os
 # import signal
 import sys
 from statistics import mean
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Optional
 
 # --- CONFIGURATION ---
 BENCH_DIR = "benchmarks"
@@ -32,8 +34,35 @@ OWNER_PORT = "10102"
 OWNER_PRIV_KEY = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 CM_ADDR = "0.0.0.0:10101"
 
+# Adaptive controller bounds used across all adaptive experiments below.
+ADAPTIVE_TMIN_MS = "1000"
+ADAPTIVE_TMAX_MS = "8000"
+ADAPTIVE_FLAGS = ["-adaptive", "-tmin", ADAPTIVE_TMIN_MS, "-tmax", ADAPTIVE_TMAX_MS]
+
+# The four configurations the reviewer asked to see compared against each
+# other: default (non-adaptive) vs. adaptive, crossed with deterministic vs.
+# probabilistic mode. Both Chart 1 and Chart 2 sweep all four so the paper can
+# show det-baseline-vs-det-adaptive *and* det-adaptive-vs-prob-adaptive from
+# the same data. The controller itself is mode-agnostic in the Go code (it
+# fires on every slot boundary regardless of Mode) - this is just wiring the
+# benchmark harness to actually exercise that.
+EXPERIMENT_CONFIGS = [
+    ("det-baseline", "deterministic", []),
+    ("det-adaptive", "deterministic", ADAPTIVE_FLAGS),
+    ("prob-baseline", "probabilistic", []),
+    ("prob-adaptive", "probabilistic", ADAPTIVE_FLAGS),
+]
+
 LOG_PATTERN = re.compile(
-    r"^\s*([\d\.]+)s\s*\|\s*([\d\.]+)\s*B/s\s*\|\s*([\d\.]+)\s*B/s\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*(\d+)\s*B\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)"
+    r"^\s*([\d\.]+)s\s*\|\s*([\d\.]+)\s*B/s\s*\|\s*([\d\.]+)\s*B/s\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*(\d+)\s*B\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*([\d\.]+)\s*\|\s*(\d+)\s*\|\s*(\d+)"
+)
+
+# [KEYCHAIN] exhausted after 12.345s, refilling
+KEYCHAIN_PATTERN = re.compile(r"\[KEYCHAIN\] exhausted after ([\d.]+)s")
+
+# [PROB-ADAPTIVE] t=1.234s T_cur=4000ms U_cur=0.50 Qlen=512 Qcap=1024 T_next=4500ms
+ADAPTIVE_TICK_PATTERN = re.compile(
+    r"\[PROB-ADAPTIVE\] t=([\d.]+)s T_cur=(\d+)ms U_cur=([\d.]+) Qlen=(\d+) Qcap=(\d+) T_next=(\d+)ms"
 )
 
 
@@ -43,8 +72,8 @@ def setup_directories() -> None:
         print(f"[*] Created directory: {BENCH_DIR}")
 
 
-def start_owner() -> subprocess.Popen[str]:
-    print(f"[*] Starting Owner Node on port {OWNER_PORT}...")
+def start_owner(adaptive: bool = False, num_rcds: int = 20) -> subprocess.Popen[str]:
+    print(f"[*] Starting Owner Node on port {OWNER_PORT} (num_rcds={num_rcds})...")
     cmd = [
         OWNER_BIN,
         "-eth-url",
@@ -61,7 +90,11 @@ def start_owner() -> subprocess.Popen[str]:
         HASHCHAIN_LEN,
         "-port",
         OWNER_PORT,
+        "-num-rcds",
+        str(num_rcds),
     ]
+    if adaptive:
+        cmd += ["-adaptive", "-tmin", ADAPTIVE_TMIN_MS, "-tmax", ADAPTIVE_TMAX_MS]
 
     # We use PIPE to capture stdout so we can read UUIDs
     proc = subprocess.Popen(
@@ -130,11 +163,22 @@ def get_uuids_from_owner(owner_proc: subprocess.Popen[str], count: int) -> List[
     return uuids
 
 
-def run_rcd_benchmark(mode: str, run_id: int, uid: str) -> str:
-    # uid is passed in now!
-    log_filename = f"{BENCH_DIR}/run_{run_id:02d}_{mode}_{uid}.log"
+def run_rcd_benchmark(
+    label: str,
+    run_id: int,
+    uid: str,
+    mode: str = "probabilistic",
+    extra_args: Optional[List[str]] = None,
+    duration: Optional[int] = None,
+    hashchain_len: Optional[str] = None,
+) -> str:
+    extra_args = extra_args or []
+    run_duration = duration if duration is not None else DURATION
+    hclen = hashchain_len if hashchain_len is not None else HASHCHAIN_LEN
 
-    print(f"    -> Running {mode} (UUID: {uid})")
+    log_filename = f"{BENCH_DIR}/run_{run_id:02d}_{label}_{uid}.log"
+
+    print(f"    -> Running {label} (UUID: {uid})")
     print(f"    -> Log: {log_filename}")
 
     cmd: List[str] = [
@@ -146,7 +190,7 @@ def run_rcd_benchmark(mode: str, run_id: int, uid: str) -> str:
         "-eth-url",
         ETH_URL,
         "-hashchain-len",
-        HASHCHAIN_LEN,
+        str(hclen),
         "-owner-addr",
         OWNER_ADDR,
         "-uuid",
@@ -154,13 +198,13 @@ def run_rcd_benchmark(mode: str, run_id: int, uid: str) -> str:
         "-bench",
         "-mode",
         mode,
-    ]
+    ] + extra_args
 
     with open(log_filename, "w") as log_file:
         proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
 
         try:
-            time.sleep(DURATION)
+            time.sleep(run_duration)
         except KeyboardInterrupt:
             print("\n[!] User interrupted.")
             proc.terminate()
@@ -191,9 +235,44 @@ def parse_log_file(filepath: str) -> Dict[float, Dict[str, float]]:
                     "hmac_lat": float(match.group(7)),
                     "verify_lat": float(match.group(8)),
                     "bcast_lat": float(match.group(9)),
+                    "verified": int(match.group(10)),
+                    "dropped_premature": int(match.group(11)),
                 }
                 data_points[t] = metrics
     return data_points
+
+
+def parse_first_keychain_exhaustion(filepath: str) -> Optional[float]:
+    """Seconds from RCD start to the first genuine keychain exhaustion
+    (the [KEYCHAIN] line only fires on real exhaustion, not the initial fill
+    - see internal/rcd/rcd.go CurrentSlotKey)."""
+    with open(filepath, "r") as f:
+        for line in f:
+            m = KEYCHAIN_PATTERN.search(line)
+            if m:
+                return float(m.group(1))
+    return None
+
+
+def parse_adaptive_ticks(filepath: str) -> List[Dict[str, float]]:
+    """Time series of the controller's per-slot-boundary decisions, for the
+    step-response chart."""
+    ticks: List[Dict[str, float]] = []
+    with open(filepath, "r") as f:
+        for line in f:
+            m = ADAPTIVE_TICK_PATTERN.search(line)
+            if m:
+                ticks.append(
+                    {
+                        "t": float(m.group(1)),
+                        "t_cur_ms": float(m.group(2)),
+                        "u_cur": float(m.group(3)),
+                        "qlen": int(m.group(4)),
+                        "qcap": int(m.group(5)),
+                        "t_next_ms": float(m.group(6)),
+                    }
+                )
+    return ticks
 
 
 def aggregate_data(
@@ -256,64 +335,277 @@ def generate_markdown(
     print(f"\n[*] Report generated: {FINAL_REPORT}")
 
 
+# ---------------------------------------------------------------------------
+# tc-based congestion knobs. Bandwidth-capping (tbf), NOT loss (netem loss) -
+# see GUIDE.md/plan discussion: pure packet loss does not block a UDP sender's
+# socket write, so it never actually stresses the disclosure queue. Requires
+# CAP_NET_ADMIN (root or `sudo`); failures are reported but non-fatal so a
+# permission-less environment can still run the rate-only experiments.
+# ---------------------------------------------------------------------------
+
+
+def apply_bandwidth_cap(kbps: int, iface: str = "lo") -> bool:
+    clear_bandwidth_cap(iface)
+    if kbps <= 0:
+        return True
+    result = subprocess.run(
+        [
+            "tc",
+            "qdisc",
+            "add",
+            "dev",
+            iface,
+            "root",
+            "tbf",
+            "rate",
+            f"{kbps}kbit",
+            "burst",
+            "32kbit",
+            "latency",
+            "400ms",
+        ],
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"[!] Failed to apply {kbps}kbit/s cap on {iface}: {result.stderr.strip()}")
+        print("    (tc requires root/CAP_NET_ADMIN - try running with sudo)")
+        return False
+    return True
+
+
+def clear_bandwidth_cap(iface: str = "lo") -> None:
+    subprocess.run(
+        ["tc", "qdisc", "del", "dev", iface, "root"],
+        stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Experiment 1: keychain lifespan vs. injected message rate (Chart 1)
+# Fixed bandwidth (uncapped), sweep -msg-rate, compare adaptive vs. baseline.
+# ---------------------------------------------------------------------------
+
+LIFESPAN_RATES = [10, 25, 50, 100, 200]
+LIFESPAN_HASHCHAIN_LEN = "16"  # small so exhaustion happens within the run
+LIFESPAN_DURATION = 60
+
+
+def run_lifespan_experiment(uuid_iter) -> Dict[str, Dict[int, float]]:
+    results: Dict[str, Dict[int, float]] = {label: {} for label, _, _ in EXPERIMENT_CONFIGS}
+    print("\n--- Experiment: Keychain lifespan vs. injection rate (4-way: det/prob x baseline/adaptive) ---")
+    for rate in LIFESPAN_RATES:
+        for label, mode, extra in EXPERIMENT_CONFIGS:
+            uid = next(uuid_iter)
+            log_file = run_rcd_benchmark(
+                f"lifespan_{label}_rate{rate}",
+                1,
+                uid,
+                mode=mode,
+                extra_args=["-msg-rate", str(rate)] + extra,
+                duration=LIFESPAN_DURATION,
+                hashchain_len=LIFESPAN_HASHCHAIN_LEN,
+            )
+            t = parse_first_keychain_exhaustion(log_file)
+            # No exhaustion observed within the run window -> chain outlasted
+            # the run; record the run duration as a (lower-bound) lifespan.
+            results[label][rate] = t if t is not None else float(LIFESPAN_DURATION)
+            print(f"    rate={rate}/s {label}: exhausted after {results[label][rate]:.1f}s")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Experiment 2: throughput vs. emulated bandwidth (Chart 2)
+# Fixed saturating -msg-rate, adaptive mode, sweep bandwidth cap via tc tbf.
+# ---------------------------------------------------------------------------
+
+BANDWIDTH_CAPS_KBPS = [50, 100, 250, 500, 1000, 0]  # 0 = uncapped
+BANDWIDTH_MSG_RATE = 200
+BANDWIDTH_DURATION = 45
+
+
+def run_bandwidth_experiment(uuid_iter) -> Dict[str, Dict[int, float]]:
+    results: Dict[str, Dict[int, float]] = {label: {} for label, _, _ in EXPERIMENT_CONFIGS}
+    print("\n--- Experiment: Throughput vs. emulated bandwidth (4-way: det/prob x baseline/adaptive) ---")
+    for kbps in BANDWIDTH_CAPS_KBPS:
+        applied = apply_bandwidth_cap(kbps)
+        try:
+            for label, mode, extra in EXPERIMENT_CONFIGS:
+                uid = next(uuid_iter)
+                log_file = run_rcd_benchmark(
+                    f"bandwidth_{label}_{kbps}kbps",
+                    1,
+                    uid,
+                    mode=mode,
+                    extra_args=["-msg-rate", str(BANDWIDTH_MSG_RATE)] + extra,
+                    duration=BANDWIDTH_DURATION,
+                )
+                data = parse_log_file(log_file)
+                avg_tx = mean(d["tx_rate"] for d in data.values()) if data else 0.0
+                results[label][kbps] = avg_tx
+                bw_label = f"{kbps}kbit/s" if kbps > 0 else "uncapped"
+                print(f"    bandwidth={bw_label} {label}: avg tx={avg_tx:.1f} B/s" + ("" if applied else " (cap not applied!)"))
+        finally:
+            clear_bandwidth_cap()
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Experiment 3: step-response (quiet -> bandwidth-capped stress -> quiet)
+# Not one of the mentor's two original charts - added to actually show the
+# controller stretching under stress and recovering, not just its bounds.
+# ---------------------------------------------------------------------------
+
+STEP_QUIET_S = 30
+STEP_STRESS_S = 30
+STEP_RECOVER_S = 30
+STEP_STRESS_BANDWIDTH_KBPS = 50
+STEP_MSG_RATE = 150
+
+
+def run_step_response_experiment(uid: str) -> List[Dict[str, float]]:
+    print("\n--- Experiment: Step response (quiet -> stress -> quiet) ---")
+    clear_bandwidth_cap()
+    log_filename = f"{BENCH_DIR}/step_response_{uid}.log"
+    cmd = [
+        RCD_BIN,
+        "-contract",
+        CONTRACT_ADDR,
+        "-disclosure-delay",
+        DISCLOSURE_DELAY,
+        "-eth-url",
+        ETH_URL,
+        "-hashchain-len",
+        HASHCHAIN_LEN,
+        "-owner-addr",
+        OWNER_ADDR,
+        "-uuid",
+        uid,
+        "-bench",
+        "-mode",
+        "probabilistic",
+        "-msg-rate",
+        str(STEP_MSG_RATE),
+    ] + ADAPTIVE_FLAGS
+
+    with open(log_filename, "w") as log_file:
+        proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+        try:
+            print(f"    quiet for {STEP_QUIET_S}s...")
+            time.sleep(STEP_QUIET_S)
+            print(f"    applying {STEP_STRESS_BANDWIDTH_KBPS}kbit/s cap for {STEP_STRESS_S}s...")
+            apply_bandwidth_cap(STEP_STRESS_BANDWIDTH_KBPS)
+            time.sleep(STEP_STRESS_S)
+            print(f"    releasing cap, recovering for {STEP_RECOVER_S}s...")
+            clear_bandwidth_cap()
+            time.sleep(STEP_RECOVER_S)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            clear_bandwidth_cap()
+
+    return parse_adaptive_ticks(log_filename)
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Prob-Adaptive Inf-TESLA++ benchmark suite")
+    parser.add_argument(
+        "--experiment",
+        choices=["baseline", "lifespan", "bandwidth", "step", "all"],
+        default="all",
+        help="Which experiment(s) to run (default: all)",
+    )
+    args = parser.parse_args()
+
     setup_directories()
-    owner_proc = start_owner()
+
+    run_baseline = args.experiment in ("baseline", "all")
+    run_lifespan = args.experiment in ("lifespan", "all")
+    run_bandwidth = args.experiment in ("bandwidth", "all")
+    run_step = args.experiment in ("step", "all")
+
+    total_uuids = 0
+    if run_baseline:
+        total_uuids += 2 * RUNS_PER_MODE
+    if run_lifespan:
+        total_uuids += len(EXPERIMENT_CONFIGS) * len(LIFESPAN_RATES)
+    if run_bandwidth:
+        total_uuids += len(EXPERIMENT_CONFIGS) * len(BANDWIDTH_CAPS_KBPS)
+    if run_step:
+        total_uuids += 1
+
+    owner_proc = start_owner(
+        adaptive=(run_lifespan or run_bandwidth or run_step),
+        num_rcds=max(total_uuids, 1),
+    )
 
     try:
-        # Capture UUIDs (Total needed = 2 * RUNS_PER_MODE)
-        total_uuids_needed = 2 * RUNS_PER_MODE
-        uuids = get_uuids_from_owner(owner_proc, total_uuids_needed)
+        uuids = get_uuids_from_owner(owner_proc, total_uuids)
+        if len(uuids) < total_uuids:
+            print("[!] Not enough UUIDs captured to run the full requested suite.")
+        uuid_iter = iter(uuids)
 
-        # Split UUIDs
-        det_uuids = uuids[:RUNS_PER_MODE]
-        prob_uuids = uuids[RUNS_PER_MODE:]
+        if run_baseline:
+            det_uuids = [next(uuid_iter) for _ in range(RUNS_PER_MODE)]
+            prob_uuids = [next(uuid_iter) for _ in range(RUNS_PER_MODE)]
 
-        if len(det_uuids) < RUNS_PER_MODE or len(prob_uuids) < RUNS_PER_MODE:
-            print("[!] Not enough UUIDs captured to run full benchmark suite.")
-            # You might want to exit here or run fewer benchmarks
+            det_raw_data: List[Dict[float, Dict[str, float]]] = []
+            prob_raw_data: List[Dict[float, Dict[str, float]]] = []
 
-        det_raw_data: List[Dict[float, Dict[str, float]]] = []
-        prob_raw_data: List[Dict[float, Dict[str, float]]] = []
+            print(
+                f"\n[*] Starting Baseline Benchmark Suite ({RUNS_PER_MODE} runs per mode, {DURATION}s each)"
+            )
 
-        print(
-            f"\n[*] Starting Benchmark Suite ({RUNS_PER_MODE} runs per mode, {DURATION}s each)"
-        )
+            print("\n--- Phase 1: Deterministic Mode ---")
+            for i, uid in enumerate(det_uuids):
+                run_num = i + 1
+                print(f"[*] Run {run_num}/{RUNS_PER_MODE}...")
+                log_file = run_rcd_benchmark("deterministic", run_num, uid, mode="deterministic")
+                det_raw_data.append(parse_log_file(log_file))
+                time.sleep(1)
 
-        # 1. Deterministic Loop
-        print("\n--- Phase 1: Deterministic Mode ---")
-        for i, uid in enumerate(det_uuids):
-            run_num = i + 1
-            print(f"[*] Run {run_num}/{RUNS_PER_MODE}...")
-            # Pass the UID here!
-            log_file = run_rcd_benchmark("deterministic", run_num, uid)
-            run_data = parse_log_file(log_file)
-            det_raw_data.append(run_data)
-            time.sleep(1)
+            print("\n--- Phase 2: Probabilistic Mode ---")
+            for i, uid in enumerate(prob_uuids):
+                run_num = i + 1
+                print(f"[*] Run {run_num}/{RUNS_PER_MODE}...")
+                log_file = run_rcd_benchmark("probabilistic", run_num, uid, mode="probabilistic")
+                prob_raw_data.append(parse_log_file(log_file))
+                time.sleep(1)
 
-        # 2. Probabilistic Loop
-        print("\n--- Phase 2: Probabilistic Mode ---")
-        for i, uid in enumerate(prob_uuids):
-            run_num = i + 1
-            print(f"[*] Run {run_num}/{RUNS_PER_MODE}...")
-            # Pass the UID here!
-            log_file = run_rcd_benchmark("probabilistic", run_num, uid)
-            run_data = parse_log_file(log_file)
-            prob_raw_data.append(run_data)
-            time.sleep(1)
+            print("\n[*] Aggregating baseline data...")
+            det_avg = aggregate_data(det_raw_data)
+            prob_avg = aggregate_data(prob_raw_data)
+            generate_markdown(det_avg, prob_avg)
 
-        print("\n[*] Aggregating data...")
-        det_avg = aggregate_data(det_raw_data)
-        prob_avg = aggregate_data(prob_raw_data)
+        if run_lifespan:
+            lifespan_results = run_lifespan_experiment(uuid_iter)
+            with open(f"{BENCH_DIR}/lifespan_results.json", "w") as f:
+                json.dump(lifespan_results, f, indent=2)
+            print(f"[*] Saved {BENCH_DIR}/lifespan_results.json")
 
-        generate_markdown(det_avg, prob_avg)
+        if run_bandwidth:
+            bandwidth_results = run_bandwidth_experiment(uuid_iter)
+            with open(f"{BENCH_DIR}/bandwidth_results.json", "w") as f:
+                json.dump(bandwidth_results, f, indent=2)
+            print(f"[*] Saved {BENCH_DIR}/bandwidth_results.json")
+
+        if run_step:
+            step_uid = next(uuid_iter)
+            ticks = run_step_response_experiment(step_uid)
+            with open(f"{BENCH_DIR}/step_response_ticks.json", "w") as f:
+                json.dump(ticks, f, indent=2)
+            print(f"[*] Saved {BENCH_DIR}/step_response_ticks.json ({len(ticks)} ticks)")
 
     finally:
         print("[*] Stopping Owner Node...")
         owner_proc.terminate()
         try:
             owner_proc.wait(timeout=2)
-        except:
+        except Exception:
             owner_proc.kill()
 
 

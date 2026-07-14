@@ -21,6 +21,11 @@ func main() {
 	privKey := flag.String("private-key", "", "Owner private key in hex format (required)")
 	disclosureDelay := flag.Uint64("disclosure-delay", 2, "Disclosure delay for key revelation")
 
+	adaptive := flag.Bool("adaptive", false, "Store keychains via storeAdaptiveKey (with TMin/TMax) instead of storeKey")
+	tMin := flag.Uint64("tmin", 1000, "Adaptive mode: minimum slot duration in ms")
+	tMax := flag.Uint64("tmax", 8000, "Adaptive mode: maximum slot duration in ms")
+	numRCDs := flag.Int("num-rcds", 20, "Number of RCD UUIDs to pre-generate and print")
+
 	flag.Parse()
 
 	if *cmAddr == "" || *port == 0 || *ethURL == "" || *contractAddr == "" || *privKey == "" {
@@ -36,6 +41,9 @@ func main() {
 		ContractAddr:    *contractAddr,
 		PrivateKey:      *privKey,
 		DisclosureDelay: *disclosureDelay,
+		Adaptive:        *adaptive,
+		TMin:            *tMin,
+		TMax:            *tMax,
 	}
 
 	o, err := owner.New(cfg)
@@ -45,7 +53,7 @@ func main() {
 	defer o.Close()
 
 	var rcds []uuid.UUID
-	for range 20 {
+	for range *numRCDs {
 		rcds = append(rcds, o.NewRCD())
 	}
 

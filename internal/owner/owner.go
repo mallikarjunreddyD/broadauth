@@ -15,6 +15,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	contracts "github.com/virinci/broadauth/internal/contract"
 
@@ -42,6 +43,10 @@ type Owner struct {
 	contract        *contracts.Contract
 	auth            *bind.TransactOpts
 	disclosureDelay uint64
+
+	adaptive bool
+	tMin     uint64
+	tMax     uint64
 }
 
 type Config struct {
@@ -52,6 +57,12 @@ type Config struct {
 	ContractAddr    string
 	PrivateKey      string
 	DisclosureDelay uint64
+
+	// Adaptive slot timing: when set, new keychains are stored via
+	// storeAdaptiveKey (carrying TMin/TMax) instead of storeKey.
+	Adaptive bool
+	TMin     uint64
+	TMax     uint64
 }
 
 func New(cfg Config) (*Owner, error) {
@@ -110,6 +121,9 @@ func New(cfg Config) (*Owner, error) {
 		contract:        contract,
 		auth:            auth,
 		disclosureDelay: cfg.DisclosureDelay,
+		adaptive:        cfg.Adaptive,
+		tMin:            cfg.TMin,
+		tMax:            cfg.TMax,
 	}, nil
 }
 
@@ -217,18 +231,34 @@ func (o *Owner) handleRCD(conn net.Conn) {
 	disclosureDelay := new(big.Int).SetUint64(o.disclosureDelay)
 
 	log.Printf(
-		"RCD:%s index:%d startTime:%d endTime:%d delay:%d",
-		id, nextIndex.Uint64(), startTime.Uint64(), endTime.Uint64(), disclosureDelay.Uint64())
+		"RCD:%s index:%d startTime:%d endTime:%d delay:%d adaptive:%v",
+		id, nextIndex.Uint64(), startTime.Uint64(), endTime.Uint64(), disclosureDelay.Uint64(), o.adaptive)
 
-	tx, err := o.contract.StoreKey(
-		o.auth,
-		rcdBigInt,
-		nextIndex,
-		string(first),
-		startTime,
-		endTime,
-		disclosureDelay,
-	)
+	var tx *types.Transaction
+	var err error
+	if o.adaptive {
+		tx, err = o.contract.StoreAdaptiveKey(
+			o.auth,
+			rcdBigInt,
+			nextIndex,
+			string(first),
+			startTime,
+			endTime,
+			disclosureDelay,
+			new(big.Int).SetUint64(o.tMin),
+			new(big.Int).SetUint64(o.tMax),
+		)
+	} else {
+		tx, err = o.contract.StoreKey(
+			o.auth,
+			rcdBigInt,
+			nextIndex,
+			string(first),
+			startTime,
+			endTime,
+			disclosureDelay,
+		)
+	}
 	if err != nil {
 		log.Printf("RCD:%s storeKey failed: %v", id, err)
 		return

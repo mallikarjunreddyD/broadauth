@@ -22,9 +22,13 @@ func main() {
 	disclosureDelay := flag.Uint64("disclosure-delay", 2, "Disclosure delay for key revelation")
 	simulationTime := flag.Duration("simulation-time", 3*time.Minute, "Duration to run the simulation")
 	modeStr := flag.String("mode", "", "Operation mode: 'deterministic' or 'probabilistic'")
-	
-	// NEW FLAG
+
 	bench := flag.Bool("bench", false, "Enable runtime benchmarking metrics")
+
+	adaptive := flag.Bool("adaptive", false, "Enable Prob-Adaptive slot timing (EIP-1559-style queue-utilization controller)")
+	tMin := flag.Uint64("tmin", 1000, "Adaptive mode: minimum slot duration in ms")
+	tMax := flag.Uint64("tmax", 8000, "Adaptive mode: maximum slot duration in ms")
+	msgRate := flag.Int("msg-rate", 50, "Traffic generator rate in packets/sec")
 
 	flag.Parse()
 
@@ -60,6 +64,10 @@ func main() {
 		SimulationTime:     *simulationTime,
 		Mode:               mode,
 		EnableBenchmarking: *bench, // Pass the flag value
+		Adaptive:           *adaptive,
+		TMin:               *tMin,
+		TMax:               *tMax,
+		MessageRate:        *msgRate,
 	}
 
 	r, err := rcd.New(cfg)

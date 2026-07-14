@@ -12,6 +12,8 @@ contract InfTESLAplusplus {
         mapping(uint => uint) disclosureDelay;
         mapping(uint => string) key;
         mapping(uint => bool) isIndexExist;
+        mapping(uint => uint) tMin;
+        mapping(uint => uint) tMax;
         uint currentIndex;
     }
 
@@ -73,6 +75,35 @@ contract InfTESLAplusplus {
             RCDs[_rcd].startTime[currentIndex],
             RCDs[_rcd].endTime[currentIndex],
             RCDs[_rcd].disclosureDelay[currentIndex]
+        );
+    }
+
+    function storeAdaptiveKey(
+        uint _rcd,
+        uint _index,
+        string memory _key,
+        uint _startTime,
+        uint _endTime,
+        uint _disclosurDelay,
+        uint _tMin,
+        uint _tMax
+    ) public {
+        storeKey(_rcd, _index, _key, _startTime, _endTime, _disclosurDelay);
+        RCDs[_rcd].tMin[_index] = _tMin;
+        RCDs[_rcd].tMax[_index] = _tMax;
+    }
+
+    function getAdaptiveKey(
+        uint _rcd
+    ) public view returns (string memory, uint, uint, uint, uint, uint) {
+        uint currentIndex = RCDs[_rcd].currentIndex;
+        return (
+            RCDs[_rcd].key[currentIndex],
+            RCDs[_rcd].startTime[currentIndex],
+            RCDs[_rcd].endTime[currentIndex],
+            RCDs[_rcd].disclosureDelay[currentIndex],
+            RCDs[_rcd].tMin[currentIndex],
+            RCDs[_rcd].tMax[currentIndex]
         );
     }
 
