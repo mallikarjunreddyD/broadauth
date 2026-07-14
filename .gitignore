@@ -9,3 +9,4 @@
 /papers/
 /benchmarks/
 pyrightconfig.json
+**/__pycache__/*
