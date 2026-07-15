@@ -71,13 +71,23 @@ func (a *AdaptiveSlotSource) GetDuration() uint64 {
 // receiver's separate wall-clock Theorem-1 check, not by this pacing
 // itself).
 //
+// The channel is buffered by 1 and the fan-out send is non-blocking: if a
+// subscriber (e.g. disclosureWorker mid-Broadcast on a burst of ready
+// disclosures) hasn't consumed the previous tick yet, this tick is dropped
+// for it rather than blocking. That's deliberate - GetSlot()'s atomic
+// counter is the real source of truth and always advances on schedule; a
+// channel send here is only a wake-up nudge. A *blocking* send would let
+// one slow subscriber stall the shared counter for every other subscriber
+// and every GetSlot() caller (this was a real bug: a busy disclosureWorker
+// once froze the counter at slot 1 for 20+ real seconds, causing a
+// hashchain-refill request to read a stale slot value long after real time
+// had moved on).
+//
 // The returned channel is never closed (only ctx.Done() signals the end -
 // every caller in this codebase already selects on that directly rather
-// than relying on the channel closing). That's deliberate: closing it from
-// a second goroutine racing against run()'s send loop, both triggered by
-// the same ctx, would risk a send-on-closed-channel panic.
+// than relying on the channel closing).
 func (a *AdaptiveSlotSource) Ticker(ctx context.Context) <-chan Slot {
-	ch := make(chan Slot)
+	ch := make(chan Slot, 1)
 
 	a.subsMu.Lock()
 	a.subs[ch] = struct{}{}
@@ -109,8 +119,7 @@ func (a *AdaptiveSlotSource) run(ctx context.Context) {
 			for _, ch := range subs {
 				select {
 				case ch <- Slot(newSlot):
-				case <-ctx.Done():
-					return
+				default:
 				}
 			}
 		}

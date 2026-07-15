@@ -344,33 +344,52 @@ def generate_markdown(
 # ---------------------------------------------------------------------------
 
 
+# The RCD's own broadcast/receive port (see internal/broadcast/udp_broadcast.go
+# DefaultUDPConfig). This is the only traffic the bandwidth experiment should
+# throttle.
+RCD_BROADCAST_PORT = 8888
+
+
 def apply_bandwidth_cap(kbps: int, iface: str = "lo") -> bool:
+    """Throttles only RCD broadcast traffic (UDP port 8888), not the whole
+    interface. A blanket `tc tbf` on the interface root also throttles the
+    owner's JSON-RPC calls to anvil (port 8545) and the owner<->RCD
+    hashchain-provisioning TCP traffic (port 10102) - both unrelated to what
+    this experiment measures. Under even a modest cap, that starves the
+    *initial keychain fill* (which already costs multiple real on-chain
+    confirmations even uncapped) well past the run's duration, so every
+    mode reports zero throughput regardless of adaptive/baseline or
+    deterministic/probabilistic - the bottleneck ends up upstream of
+    anything mode-specific.
+    """
     clear_bandwidth_cap(iface)
     if kbps <= 0:
         return True
-    result = subprocess.run(
+
+    steps = [
+        ["tc", "qdisc", "add", "dev", iface, "root", "handle", "1:", "prio"],
         [
-            "tc",
-            "qdisc",
-            "add",
-            "dev",
-            iface,
-            "root",
-            "tbf",
-            "rate",
-            f"{kbps}kbit",
-            "burst",
-            "32kbit",
-            "latency",
-            "400ms",
+            "tc", "qdisc", "add", "dev", iface, "parent", "1:3", "handle", "30:",
+            "tbf", "rate", f"{kbps}kbit", "burst", "32kbit", "latency", "400ms",
         ],
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if result.returncode != 0:
-        print(f"[!] Failed to apply {kbps}kbit/s cap on {iface}: {result.stderr.strip()}")
-        print("    (tc requires root/CAP_NET_ADMIN - try running with sudo)")
-        return False
+        [
+            "tc", "filter", "add", "dev", iface, "protocol", "ip", "parent", "1:0",
+            "prio", "1", "u32", "match", "ip", "dport", str(RCD_BROADCAST_PORT), "0xffff",
+            "flowid", "1:3",
+        ],
+        [
+            "tc", "filter", "add", "dev", iface, "protocol", "ip", "parent", "1:0",
+            "prio", "1", "u32", "match", "ip", "sport", str(RCD_BROADCAST_PORT), "0xffff",
+            "flowid", "1:3",
+        ],
+    ]
+    for cmd in steps:
+        result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            print(f"[!] Failed to apply {kbps}kbit/s cap on {iface}: {result.stderr.strip()}")
+            print("    (tc requires root/CAP_NET_ADMIN - try running with sudo)")
+            clear_bandwidth_cap(iface)
+            return False
     return True
 
 
@@ -425,9 +444,20 @@ BANDWIDTH_MSG_RATE = 200
 BANDWIDTH_DURATION = 45
 
 
-def run_bandwidth_experiment(uuid_iter) -> Dict[str, Dict[int, float]]:
-    results: Dict[str, Dict[int, float]] = {label: {} for label, _, _ in EXPERIMENT_CONFIGS}
-    print("\n--- Experiment: Throughput vs. emulated bandwidth (4-way: det/prob x baseline/adaptive) ---")
+def run_bandwidth_experiment(
+    uuid_iter,
+) -> tuple[Dict[str, Dict[int, float]], Dict[str, Dict[int, float]]]:
+    """Sweeps a real tc bandwidth cap - the only knob that reliably sustains
+    disclosure-queue congestion (raw -msg-rate alone doesn't: local loopback
+    processing drains a backlog before the next controller sample sees it).
+    Reports two reviewer-requested sender-side metrics from the same sweep,
+    since both share the identical "keychain length fixed, congestion
+    varied" setup: (1) average throughput, and (2) keychain lifespan -
+    how many real seconds a fixed-length keychain lasts as congestion rises.
+    """
+    throughput: Dict[str, Dict[int, float]] = {label: {} for label, _, _ in EXPERIMENT_CONFIGS}
+    lifespan: Dict[str, Dict[int, float]] = {label: {} for label, _, _ in EXPERIMENT_CONFIGS}
+    print("\n--- Experiment: Throughput & keychain lifespan vs. emulated bandwidth (4-way: det/prob x baseline/adaptive) ---")
     for kbps in BANDWIDTH_CAPS_KBPS:
         applied = apply_bandwidth_cap(kbps)
         try:
@@ -443,12 +473,24 @@ def run_bandwidth_experiment(uuid_iter) -> Dict[str, Dict[int, float]]:
                 )
                 data = parse_log_file(log_file)
                 avg_tx = mean(d["tx_rate"] for d in data.values()) if data else 0.0
-                results[label][kbps] = avg_tx
+                throughput[label][kbps] = avg_tx
+
+                t = parse_first_keychain_exhaustion(log_file)
+                # No exhaustion observed within the run window -> the chain
+                # outlasted the run; record the run duration as a
+                # (lower-bound) lifespan, same convention as
+                # run_lifespan_experiment.
+                lifespan[label][kbps] = t if t is not None else float(BANDWIDTH_DURATION)
+
                 bw_label = f"{kbps}kbit/s" if kbps > 0 else "uncapped"
-                print(f"    bandwidth={bw_label} {label}: avg tx={avg_tx:.1f} B/s" + ("" if applied else " (cap not applied!)"))
+                print(
+                    f"    bandwidth={bw_label} {label}: avg tx={avg_tx:.1f} B/s, "
+                    f"keychain lasted {lifespan[label][kbps]:.1f}s"
+                    + ("" if applied else " (cap not applied!)")
+                )
         finally:
             clear_bandwidth_cap()
-    return results
+    return throughput, lifespan
 
 
 # ---------------------------------------------------------------------------
@@ -588,10 +630,13 @@ def main() -> None:
             print(f"[*] Saved {BENCH_DIR}/lifespan_results.json")
 
         if run_bandwidth:
-            bandwidth_results = run_bandwidth_experiment(uuid_iter)
+            bandwidth_results, bandwidth_lifespan_results = run_bandwidth_experiment(uuid_iter)
             with open(f"{BENCH_DIR}/bandwidth_results.json", "w") as f:
                 json.dump(bandwidth_results, f, indent=2)
             print(f"[*] Saved {BENCH_DIR}/bandwidth_results.json")
+            with open(f"{BENCH_DIR}/bandwidth_lifespan_results.json", "w") as f:
+                json.dump(bandwidth_lifespan_results, f, indent=2)
+            print(f"[*] Saved {BENCH_DIR}/bandwidth_lifespan_results.json")
 
         if run_step:
             step_uid = next(uuid_iter)
