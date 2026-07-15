@@ -44,9 +44,9 @@ const (
 )
 
 // networkDelaySlack is the delta_net term in the receiver's premature-
-// disclosure wait bound (d*Tmin + delta_net): slack added on top of the
-// fastest-legitimate-pace disclosure delay to absorb ordinary network
-// jitter between sender and receiver.
+// disclosure wait bound (d*Tmin - delta_net): tolerance subtracted from the
+// fastest-legitimate-pace disclosure delay to absorb ordinary jitter
+// between the HMAC and key disclosure's independent network deliveries.
 const networkDelaySlack = 250 * time.Millisecond
 
 // Metrics holds atomic counters for benchmarking
@@ -607,7 +607,19 @@ func (r *RCD) broadcastDeterministic(data []byte) error {
 
 	log.Printf("Sent HMAC message for slot %d", currentSlot)
 
-	targetSlot := currentSlot + r.disclosureDelay
+	// +1: CurrentSlotKey() only advances once per tick, so many messages
+	// generated throughout a single slot's real-time window all share this
+	// same currentSlot/targetSlot - but disclosureWorker discloses all of
+	// them simultaneously, at the single real tick where currentSlot
+	// reaches targetSlot. A message HMAC'd right at the start of its slot
+	// gets close to a full disclosureDelay ticks of real separation before
+	// that moment; one HMAC'd right at the end of the same slot gets up to
+	// one full tick less - the exact same real-time-vs-label mismatch as
+	// flushBatch's, just arising from per-message variance within a shared
+	// slot rather than a batch label offset. Anchoring one tick later
+	// guarantees even the latest-in-slot message still gets the full
+	// disclosureDelay ticks of real separation.
+	targetSlot := currentSlot + r.disclosureDelay + 1
 	keyArray := [32]byte{}
 	copy(keyArray[:], key)
 
@@ -856,19 +868,30 @@ func (r *RCD) handleMessage(data []byte) {
 
 		// Premature-disclosure check: don't trust a disclosed key until our
 		// own local wall-clock stopwatch, started when we first saw this
-		// slot's committed HMAC, shows at least d*Tmin + network_delay_slack
-		// elapsed. Tmin (not Tmax) is the correct bound here: it's the
-		// fastest a protocol-compliant sender is ever allowed to disclose,
-		// so nothing legitimate can arrive faster than d*Tmin - anything
-		// that does is either a sender violating its own on-chain-published
-		// floor or a forged/replayed disclosure, and either way should be
-		// rejected. Using Tmax instead (the slowest allowed pace) is overly
-		// conservative: it doesn't catch anything Tmin wouldn't also catch,
-		// but it rejects every genuine fast disclosure whenever the sender
-		// is legitimately uncongested - throwing away exactly the low-
-		// latency benefit adaptive timing is supposed to provide. Tmin
-		// comes from the smart contract, never from the sender's live
-		// timing.
+		// slot's committed HMAC, shows at least d*Tmin - network_delay_slack
+		// elapsed. Tmin is the fastest a protocol-compliant sender is ever
+		// allowed to disclose, so nothing legitimate can arrive meaningfully
+		// faster than d*Tmin - anything that does (beyond the slack below)
+		// is either a sender violating its own on-chain-published floor or
+		// a forged/replayed disclosure, and either way should be rejected.
+		//
+		// networkDelaySlack is SUBTRACTED, not added: hmacReceivedAt and
+		// this elapsed measurement are both read from our own local clock,
+		// so there's no cross-clock skew to compensate for here. What the
+		// slack absorbs instead is jitter between the two independent
+		// network deliveries (the HMAC and the key can each arrive slightly
+		// faster or slower than the other) - which can make an honest,
+		// exactly-Tmin-paced disclosure's *observed* elapsed time come out
+		// smaller than the true underlying gap, never larger. Adding the
+		// slack (the earlier version of this check) demanded more elapsed
+		// time than even a perfectly-paced honest sender running at Tmin
+		// could ever produce, rejecting 100% of calm-condition disclosures
+		// - exactly the low-latency case GUIDE.md 1.3 says must work.
+		// Subtracting it forgives that plausible negative jitter without
+		// opening a meaningful attack window: a forger still has to land
+		// inside a fixed, small band and still needs the real key, which
+		// requires breaking the hash chain regardless of timing. Tmin comes
+		// from the smart contract, never from the sender's live timing.
 		if r.adaptive {
 			timing, err := r.getSenderTiming(receivedMessage.SenderID)
 			if err != nil {
@@ -876,7 +899,12 @@ func (r *RCD) handleMessage(data []byte) {
 				atomic.AddInt64(&r.metrics.MessagesDroppedPremature, 1)
 				return
 			}
-			minWait := time.Duration(timing.disclosureDelay*timing.tMin)*time.Millisecond + networkDelaySlack
+			minWait := time.Duration(timing.disclosureDelay*timing.tMin) * time.Millisecond
+			if minWait > networkDelaySlack {
+				minWait -= networkDelaySlack
+			} else {
+				minWait = 0
+			}
 			elapsed := time.Since(hmacReceivedAtVal.(time.Time))
 			if elapsed < minWait {
 				log.Printf("[SECURITY] Rejected premature key disclosure from %s (waited %s, need >= %s)", receivedMessage.SenderID, elapsed, minWait)
@@ -972,37 +1000,70 @@ func (r *RCD) getSenderTiming(senderID uuid.UUID) (timingInfo, error) {
 func (r *RCD) verifyKey(senderID uuid.UUID, key []byte) bool {
 	commitmentKey, ok := r.commitmentKeys.Load(senderID)
 	if !ok {
-		if r.adaptive {
-			contractKey, _, _, _, _, _, err := r.contract.GetAdaptiveKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
-			if err != nil || len(contractKey) == 0 {
-				return false
-			}
-			commitmentKey = []byte(contractKey)
-		} else {
-			contractKey, _, _, _, err := r.contract.GetKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
-			if err != nil || len(contractKey) == 0 {
-				// Log error via wrapping if we were returning, but here we just return bool
-				return false
-			}
-			commitmentKey = []byte(contractKey)
+		fetched, err := r.fetchCommitmentKey(senderID)
+		if err != nil {
+			return false
 		}
+		commitmentKey = fetched
 		r.commitmentKeys.Store(senderID, commitmentKey)
 	}
 
-	currentKey := make([]byte, 32)
-	copy(currentKey, key)
-
-	if len(currentKey) == len(commitmentKey.([]byte)) && hmac.Equal(currentKey, commitmentKey.([]byte)) {
-		r.commitmentKeys.Store(senderID, currentKey)
+	if walksToCommitment(key, commitmentKey.([]byte), r.hashchainLen) {
+		r.commitmentKeys.Store(senderID, key)
 		return true
 	}
 
-	for range r.hashchainLen + 1 {
+	// The cached commitment can be stale: each keychain rotation (a
+	// hashchain refill) starts a brand new, unrelated hash chain, so a
+	// disclosed key from a freshly rotated keychain will never walk
+	// forward to an old chain's anchor - commitmentKeys only ever ratchets
+	// forward on success, so nothing else would refresh it here otherwise.
+	// Re-fetch once from the contract (the source of truth for whichever
+	// keychain is *currently* active for this sender) before giving up.
+	fetched, err := r.fetchCommitmentKey(senderID)
+	if err != nil {
+		return false
+	}
+	if walksToCommitment(key, fetched, r.hashchainLen) {
+		r.commitmentKeys.Store(senderID, key)
+		return true
+	}
+	r.commitmentKeys.Store(senderID, fetched)
+	return false
+}
+
+// fetchCommitmentKey reads a sender's current on-chain hash-chain anchor
+// (adaptive or plain, matching this RCD's own mode).
+func (r *RCD) fetchCommitmentKey(senderID uuid.UUID) ([]byte, error) {
+	if r.adaptive {
+		contractKey, _, _, _, _, _, err := r.contract.GetAdaptiveKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
+		if err != nil || len(contractKey) == 0 {
+			return nil, fmt.Errorf("failed to fetch adaptive commitment key: %v", err)
+		}
+		return []byte(contractKey), nil
+	}
+	contractKey, _, _, _, err := r.contract.GetKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
+	if err != nil || len(contractKey) == 0 {
+		return nil, fmt.Errorf("failed to fetch commitment key: %v", err)
+	}
+	return []byte(contractKey), nil
+}
+
+// walksToCommitment reports whether hashing key forward (up to
+// hashchainLen+1 times) reaches commitment.
+func walksToCommitment(key, commitment []byte, hashchainLen int) bool {
+	currentKey := make([]byte, 32)
+	copy(currentKey, key)
+
+	if len(currentKey) == len(commitment) && hmac.Equal(currentKey, commitment) {
+		return true
+	}
+
+	for range hashchainLen + 1 {
 		h := sha256.New()
 		h.Write(currentKey)
 		currentKey = h.Sum(nil)
-		if len(currentKey) == len(commitmentKey.([]byte)) && hmac.Equal(currentKey, commitmentKey.([]byte)) {
-			r.commitmentKeys.Store(senderID, key)
+		if len(currentKey) == len(commitment) && hmac.Equal(currentKey, commitment) {
 			return true
 		}
 	}
