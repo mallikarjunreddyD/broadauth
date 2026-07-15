@@ -19,7 +19,15 @@ func DefaultUDPConfig() UDPConfig {
 	return UDPConfig{
 		BroadcastAddr: "255.255.255.255:8888",
 		ListenAddr:    ":8888",
-		BufferSize:    1024,
+		// 65507 is the max UDP/IPv4 payload size. Probabilistic mode's
+		// Bloom-filter batches scale with batch size (a burst of hundreds
+		// of buffered messages easily exceeds a smaller fixed buffer), and
+		// ReadFromUDP silently truncates any datagram bigger than the
+		// buffer passed to it rather than erroring - which surfaces
+		// downstream as a JSON-unmarshal failure on the receiver, not as
+		// anything obviously buffer-related. Sizing to the protocol max
+		// removes that failure mode outright.
+		BufferSize: 65507,
 	}
 }
 

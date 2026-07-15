@@ -43,9 +43,10 @@ const (
 	adjustmentFactor  = 0.25 // caps a single step at +/-12.5% when Delta=+/-0.5
 )
 
-// networkDelaySlack is the delta_net term in Theorem 1's receiver wait bound
-// (d*Tmax + delta_net): slack added on top of the worst-case disclosure delay
-// to absorb ordinary network jitter between sender and receiver.
+// networkDelaySlack is the delta_net term in the receiver's premature-
+// disclosure wait bound (d*Tmin + delta_net): slack added on top of the
+// fastest-legitimate-pace disclosure delay to absorb ordinary network
+// jitter between sender and receiver.
 const networkDelaySlack = 250 * time.Millisecond
 
 // Metrics holds atomic counters for benchmarking
@@ -147,13 +148,13 @@ type Config struct {
 	MessageRate int    // packets/sec for the traffic generator
 }
 
-// timingInfo caches a sender's disclosure delay and Tmax, fetched once from
+// timingInfo caches a sender's disclosure delay and Tmin, fetched once from
 // the smart contract via getAdaptiveKey and reused for every subsequent
-// wall-clock safety check on that sender's disclosures (see Theorem 1 check
-// in handleMessage).
+// wall-clock safety check on that sender's disclosures (see the premature-
+// disclosure check in handleMessage).
 type timingInfo struct {
 	disclosureDelay uint64
-	tMax            uint64
+	tMin            uint64
 }
 
 func New(cfg Config) (*RCD, error) {
@@ -408,12 +409,20 @@ func (r *RCD) broadcastLoop() {
 		case <-r.ctx.Done():
 			return
 		case <-trafficTicker.C:
-			msg := fmt.Sprintf("%s: payload_data_%d", r.id, r.messageCounter)
+			msg := []byte(fmt.Sprintf("%s: payload_data_%d", r.id, r.messageCounter))
 			r.messageCounter++
-			if err := r.broadcast([]byte(msg)); err != nil {
-				// Logs will be discarded if benchmarking is enabled
-				log.Printf("Failed to broadcast message: %v", err)
-			}
+			// Backgrounded (like the flushBatch call below): broadcast()
+			// can block for seconds inside CurrentSlotKey() on a hashchain
+			// refill (owner round-trip + on-chain confirmation). Running it
+			// inline here would stall this select loop - and therefore
+			// r.ctx.Done() responsiveness and Stop()'s wg.Wait() - for the
+			// full duration of that refill.
+			go func(m []byte) {
+				if err := r.broadcast(m); err != nil {
+					// Logs will be discarded if benchmarking is enabled
+					log.Printf("Failed to broadcast message: %v", err)
+				}
+			}(msg)
 		case currentSlot := <-slotTicker:
 			go func(slotToFlush uint64) {
 				if err := r.flushBatch(slotToFlush); err != nil {
@@ -676,7 +685,15 @@ func (r *RCD) flushBatch(slot uint64) error {
 
 	log.Printf("Sent HMAC message (Batch of %d messages) for slot %d", count, slot)
 
-	targetSlot := slot + r.disclosureDelay
+	// +1: this HMAC batch is labeled "slot" (the just-completed slot, see
+	// broadcastLoop's flushBatch(currentSlot-1) call), but the broadcast
+	// itself happens one tick later, at real time currentSlot. Computing
+	// targetSlot from the label alone shorts the real-world gap between
+	// this broadcast and disclosure eligibility by one full tick -
+	// disclosureDelay=2 was only ever getting 1 real tick of separation.
+	// Anchoring to the label+1 (the tick this actually went out on)
+	// restores the intended disclosureDelay ticks of real elapsed time.
+	targetSlot := slot + r.disclosureDelay + 1
 	keyArray := [32]byte{}
 	copy(keyArray[:], key)
 
@@ -806,7 +823,7 @@ func (r *RCD) handleMessage(data []byte) {
 		// clock (the fixed-slot baseline). Under adaptive mode each process
 		// free-runs its own AdaptiveSlotSource, so the two counters are not
 		// comparable; the equivalent safety property is instead enforced
-		// as a wall-clock check on key disclosure, below (Theorem 1).
+		// as a wall-clock check on key disclosure, below.
 		if !r.adaptive {
 			securityCutoff := receivedMessage.Slot + r.disclosureDelay
 			if currentSlot >= securityCutoff {
@@ -837,11 +854,21 @@ func (r *RCD) handleMessage(data []byte) {
 			return
 		}
 
-		// Theorem 1 (Timing Safety): don't trust a disclosed key until our
+		// Premature-disclosure check: don't trust a disclosed key until our
 		// own local wall-clock stopwatch, started when we first saw this
-		// slot's committed HMAC, shows at least d*Tmax + network_delay_slack
-		// elapsed. Tmax comes from the smart contract, never from the
-		// sender's live timing.
+		// slot's committed HMAC, shows at least d*Tmin + network_delay_slack
+		// elapsed. Tmin (not Tmax) is the correct bound here: it's the
+		// fastest a protocol-compliant sender is ever allowed to disclose,
+		// so nothing legitimate can arrive faster than d*Tmin - anything
+		// that does is either a sender violating its own on-chain-published
+		// floor or a forged/replayed disclosure, and either way should be
+		// rejected. Using Tmax instead (the slowest allowed pace) is overly
+		// conservative: it doesn't catch anything Tmin wouldn't also catch,
+		// but it rejects every genuine fast disclosure whenever the sender
+		// is legitimately uncongested - throwing away exactly the low-
+		// latency benefit adaptive timing is supposed to provide. Tmin
+		// comes from the smart contract, never from the sender's live
+		// timing.
 		if r.adaptive {
 			timing, err := r.getSenderTiming(receivedMessage.SenderID)
 			if err != nil {
@@ -849,7 +876,7 @@ func (r *RCD) handleMessage(data []byte) {
 				atomic.AddInt64(&r.metrics.MessagesDroppedPremature, 1)
 				return
 			}
-			minWait := time.Duration(timing.disclosureDelay*timing.tMax)*time.Millisecond + networkDelaySlack
+			minWait := time.Duration(timing.disclosureDelay*timing.tMin)*time.Millisecond + networkDelaySlack
 			elapsed := time.Since(hmacReceivedAtVal.(time.Time))
 			if elapsed < minWait {
 				log.Printf("[SECURITY] Rejected premature key disclosure from %s (waited %s, need >= %s)", receivedMessage.SenderID, elapsed, minWait)
@@ -917,7 +944,7 @@ func (r *RCD) getUnverifiedMessages(slot uint64) [][]byte {
 }
 
 // getSenderTiming lazily fetches and caches a sender's disclosure delay and
-// Tmax from the smart contract via getAdaptiveKey. Also opportunistically
+// Tmin from the smart contract via getAdaptiveKey. Also opportunistically
 // caches the commitment key returned in the same call, so verifyKey's own
 // lookup below normally finds it without a second contract round-trip.
 func (r *RCD) getSenderTiming(senderID uuid.UUID) (timingInfo, error) {
@@ -925,12 +952,12 @@ func (r *RCD) getSenderTiming(senderID uuid.UUID) (timingInfo, error) {
 		return v.(timingInfo), nil
 	}
 
-	contractKey, _, _, delay, _, tMax, err := r.contract.GetAdaptiveKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
+	contractKey, _, _, delay, tMin, _, err := r.contract.GetAdaptiveKey(&bind.CallOpts{}, new(big.Int).SetBytes(senderID[:]))
 	if err != nil {
 		return timingInfo{}, fmt.Errorf("failed to fetch adaptive key: %v", err)
 	}
 
-	info := timingInfo{disclosureDelay: delay.Uint64(), tMax: tMax.Uint64()}
+	info := timingInfo{disclosureDelay: delay.Uint64(), tMin: tMin.Uint64()}
 	r.senderTiming.Store(senderID, info)
 
 	if len(contractKey) > 0 {

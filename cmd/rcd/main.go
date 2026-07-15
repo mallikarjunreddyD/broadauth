@@ -93,6 +93,15 @@ func main() {
 		log.Printf("Received signal %v, stopping simulation", sig)
 	}
 
+	// Belt-and-braces: if Stop() below ever ends up blocked (e.g. a future
+	// change reintroduces an uncancelable blocking call), a second Ctrl+C
+	// force-exits instead of leaving the process stuck with no way out.
+	go func() {
+		sig := <-sigChan
+		log.Printf("Received second signal %v, forcing exit", sig)
+		os.Exit(1)
+	}()
+
 	// Stop simulation and cleanup
 	if err := r.Stop(); err != nil {
 		log.Printf("Error during shutdown: %v", err)

@@ -21,6 +21,10 @@ type AdaptiveSlotSource struct {
 
 	mu           sync.RWMutex
 	currentDurMs uint64 // duration in milliseconds
+
+	startOnce sync.Once
+	subsMu    sync.Mutex
+	subs      map[chan Slot]struct{}
 }
 
 // NewAdaptiveSlotSource creates a source starting at slot 1, ticking at
@@ -29,6 +33,7 @@ func NewAdaptiveSlotSource(initialDurationMs uint64) *AdaptiveSlotSource {
 	return &AdaptiveSlotSource{
 		currentSlot:  1,
 		currentDurMs: initialDurationMs,
+		subs:         make(map[chan Slot]struct{}),
 	}
 }
 
@@ -55,20 +60,53 @@ func (a *AdaptiveSlotSource) GetDuration() uint64 {
 
 // Ticker yields a channel that ticks at the current (possibly changing)
 // duration, advancing the slot counter by 1 on every tick.
+//
+// Safe to call more than once on the same instance (rcd.go's broadcastLoop
+// and disclosureWorker both need their own slot ticks): the counter is only
+// ever advanced by a single background loop, started lazily on the first
+// call and fanned out to every subscriber's channel. A second independent
+// increment loop per call would race the counter forward at N times the
+// intended rate - this previously caused disclosure-delay pacing to blow
+// through its own target slots almost instantly (only caught by the
+// receiver's separate wall-clock Theorem-1 check, not by this pacing
+// itself).
+//
+// The returned channel is never closed (only ctx.Done() signals the end -
+// every caller in this codebase already selects on that directly rather
+// than relying on the channel closing). That's deliberate: closing it from
+// a second goroutine racing against run()'s send loop, both triggered by
+// the same ctx, would risk a send-on-closed-channel panic.
 func (a *AdaptiveSlotSource) Ticker(ctx context.Context) <-chan Slot {
 	ch := make(chan Slot)
 
-	go func() {
-		defer close(ch)
-		for {
-			timer := time.NewTimer(time.Duration(a.GetDuration()) * time.Millisecond)
+	a.subsMu.Lock()
+	a.subs[ch] = struct{}{}
+	a.subsMu.Unlock()
 
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return
-			case <-timer.C:
-				newSlot := atomic.AddUint64(&a.currentSlot, 1)
+	a.startOnce.Do(func() { go a.run(ctx) })
+
+	return ch
+}
+
+func (a *AdaptiveSlotSource) run(ctx context.Context) {
+	for {
+		timer := time.NewTimer(time.Duration(a.GetDuration()) * time.Millisecond)
+
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			newSlot := atomic.AddUint64(&a.currentSlot, 1)
+
+			a.subsMu.Lock()
+			subs := make([]chan Slot, 0, len(a.subs))
+			for ch := range a.subs {
+				subs = append(subs, ch)
+			}
+			a.subsMu.Unlock()
+
+			for _, ch := range subs {
 				select {
 				case ch <- Slot(newSlot):
 				case <-ctx.Done():
@@ -76,7 +114,5 @@ func (a *AdaptiveSlotSource) Ticker(ctx context.Context) <-chan Slot {
 				}
 			}
 		}
-	}()
-
-	return ch
+	}
 }

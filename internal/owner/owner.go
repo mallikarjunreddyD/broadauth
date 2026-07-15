@@ -274,7 +274,11 @@ func (o *Owner) handleRCD(conn net.Conn) {
 
 	// If currentIndex is not 0, call changeCurrentIndex after storing new key
 	if currentRCDState.currentIndex != 0 {
-		tx, err := o.contract.ChangeCurrentIndex(o.auth, rcdBigInt)
+		// blockNum here is the RCD's own slot counter (see requestHashChainOnce),
+		// the same unit-domain used for startTime/endTime above - not the real
+		// chain block number, which under AdaptiveSlotSource has no fixed
+		// relationship to it (see changeCurrentIndex in the contract).
+		tx, err := o.contract.ChangeCurrentIndex(o.auth, rcdBigInt, blockNum)
 		if err != nil {
 			log.Printf("RCD:%s failed to changeCurrentIndex: %v\n", id, err)
 			return

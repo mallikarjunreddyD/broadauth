@@ -82,7 +82,12 @@ func TestFlushBatchProbabilistic(t *testing.T) {
 		if len(dp.Message) == 0 {
 			t.Fatalf("expected disclosure payload message (BF), got empty")
 		}
-		if dp.TargetSlot != 102 { // slot + disclosureDelay
+		// slot + disclosureDelay + 1: the +1 compensates for
+		// broadcastLoop's flushBatch(currentSlot-1) call labeling this
+		// batch one tick behind the real time it's actually sent at (see
+		// flushBatch's targetSlot comment) - without it, disclosureDelay
+		// only ever gets disclosureDelay-1 real ticks of separation.
+		if dp.TargetSlot != 103 {
 			t.Fatalf("unexpected target slot: %d", dp.TargetSlot)
 		}
 	default:

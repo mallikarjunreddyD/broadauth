@@ -53,6 +53,41 @@ contract InfTESLAPlusPlusTest is Test {
         sc.storeAdaptiveKey(RCD_ID, 1, "key0", 100, 200, 2, 1000, 8000);
     }
 
+    function test_ChangeCurrentIndexUsesCallerSuppliedTimeNotBlockNumber()
+        public
+    {
+        // Regression test: changeCurrentIndex must compare endTime against
+        // the caller-supplied _currentTime (the RCD's own slot counter,
+        // which under AdaptiveSlotSource ticks independently of the chain),
+        // not block.number. block.number stays at whatever forge's default
+        // test block is - far below realistic slot-counter values - so if
+        // the check ever regresses back to block.number, this revert.
+        vm.prank(owner);
+        sc.storeKey(RCD_ID, 1, "key0", 100, 200, 2);
+
+        vm.prank(owner);
+        sc.storeKey(RCD_ID, 2, "key1", 300, 400, 2);
+
+        vm.prank(owner);
+        sc.changeCurrentIndex(RCD_ID, 250);
+
+        (string memory key, uint startTime, , ) = sc.getKey(RCD_ID);
+        assertEq(key, "key1");
+        assertEq(startTime, 300);
+    }
+
+    function test_ChangeCurrentIndexRevertsBeforeOldChainExpires() public {
+        vm.prank(owner);
+        sc.storeKey(RCD_ID, 1, "key0", 100, 200, 2);
+
+        vm.prank(owner);
+        sc.storeKey(RCD_ID, 2, "key1", 300, 400, 2);
+
+        vm.prank(owner);
+        vm.expectRevert("New chain can only started after the old chain expires");
+        sc.changeCurrentIndex(RCD_ID, 150);
+    }
+
     function test_GetKeyStillWorksAfterAdaptiveStore() public {
         // storeAdaptiveKey must remain backward compatible with plain getKey.
         vm.prank(owner);
