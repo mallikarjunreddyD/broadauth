@@ -519,8 +519,11 @@ func (r *RCD) adjustSlotDuration() {
 	if qcap > 0 {
 		uCur = float64(qlen) / float64(qcap)
 	}
-	fmt.Printf("[PROB-ADAPTIVE] t=%.3fs T_cur=%dms U_cur=%.2f Qlen=%d Qcap=%d T_next=%dms\n",
-		time.Since(r.startTime).Seconds(), tCur, uCur, qlen, qcap, tNext)
+	r.bufferMutex.Lock()
+	ingest := len(r.messageBuffer)
+	r.bufferMutex.Unlock()
+	fmt.Printf("[PROB-ADAPTIVE] t=%.3fs T_cur=%dms U_cur=%.2f Qlen=%d Qcap=%d T_next=%dms Ingest=%d ChanLen=%d\n",
+		time.Since(r.startTime).Seconds(), tCur, uCur, qlen, qcap, tNext, ingest, len(r.disclosureMessages))
 }
 
 func (r *RCD) CurrentSlotKey() (slot.Slot, []byte, error) {
@@ -588,7 +591,11 @@ func (r *RCD) broadcast(data []byte) error {
 	}
 
 	start := time.Now()
-	err = r.broadcaster.Broadcast(r.ctx, msgBytes)
+	// Application data goes on the unthrottled plane: it must not consume the
+	// auth-channel budget, or a high msg-rate starves the disclosure pipeline
+	// (flushBatch would block on the radio before it could enqueue a
+	// disclosure, so the controller's backlog signal never moves).
+	err = r.broadcaster.BroadcastUnthrottled(r.ctx, msgBytes)
 	if r.enableBenchmarking {
 		atomic.AddInt64(&r.metrics.BroadcastDuration, time.Since(start).Nanoseconds())
 		atomic.AddInt64(&r.metrics.BroadcastCount, 1)

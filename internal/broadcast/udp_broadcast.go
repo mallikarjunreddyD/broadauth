@@ -46,8 +46,9 @@ func DefaultUDPConfig() UDPConfig {
 type UDPBroadcaster struct {
 	conn             *net.UDPConn
 	addr             *net.UDPAddr
-	mu               sync.Mutex
-	radioBytesPerSec int // <=0 disables throttling
+	mu               sync.Mutex // guards the socket write
+	throttleMu       sync.Mutex // serializes auth-channel airtime (radio budget)
+	radioBytesPerSec int        // <=0 disables throttling
 }
 
 // NewUDPBroadcaster creates a new UDP broadcaster
@@ -86,22 +87,41 @@ func (b *UDPBroadcaster) Broadcast(ctx context.Context, data []byte) error {
 		// Continue with broadcasting
 	}
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// Model a constrained radio: block for the transmission time at the
-	// configured rate before sending. Held under b.mu so a shared radio
-	// serializes all senders (data, HMAC, key disclosure) through the same
-	// budget, which is what lets the disclosure backlog build under load.
+	// Model a constrained radio: serialize auth sends and block for each one's
+	// transmission time at the configured rate. Held under throttleMu (NOT the
+	// socket mu) so unthrottled application-data writes never wait on auth
+	// airtime -- only auth traffic is charged against the budget, which is what
+	// lets the disclosure backlog (and thus the controller) build under load.
 	if b.radioBytesPerSec > 0 {
+		b.throttleMu.Lock()
 		txTime := time.Duration(len(data)) * time.Second / time.Duration(b.radioBytesPerSec)
 		select {
 		case <-ctx.Done():
+			b.throttleMu.Unlock()
 			return ctx.Err()
 		case <-time.After(txTime):
 		}
+		b.throttleMu.Unlock()
 	}
 
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	_, err := b.conn.Write(data)
+	return err
+}
+
+// BroadcastUnthrottled sends immediately with no rate limit (application data
+// plane). It shares the socket mutex for a safe concurrent write but is never
+// charged against the auth-channel budget.
+func (b *UDPBroadcaster) BroadcastUnthrottled(ctx context.Context, data []byte) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	_, err := b.conn.Write(data)
 	return err
 }

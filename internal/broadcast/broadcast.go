@@ -6,8 +6,16 @@ import (
 
 // Broadcaster defines an interface for broadcasting data
 type Broadcaster interface {
-	// Broadcast sends data to all listening receivers
+	// Broadcast sends data over the throttled auth channel: it is rate-limited
+	// to RadioBytesPerSec so the disclosure/HMAC pipeline is the bottleneck the
+	// adaptive controller relieves. Used for HMACs and key disclosures.
 	Broadcast(ctx context.Context, data []byte) error
+
+	// BroadcastUnthrottled sends data over the application plane with no rate
+	// limit. Application data is not charged against the auth-channel budget,
+	// so a high message rate cannot starve the disclosure pipeline. Used for
+	// raw Data messages.
+	BroadcastUnthrottled(ctx context.Context, data []byte) error
 
 	// Close shuts down the broadcaster and releases resources
 	Close() error

@@ -22,6 +22,10 @@ func (m *mockBroadcaster) Broadcast(ctx context.Context, data []byte) error {
 	return nil
 }
 
+func (m *mockBroadcaster) BroadcastUnthrottled(ctx context.Context, data []byte) error {
+	return m.Broadcast(ctx, data)
+}
+
 func (m *mockBroadcaster) Close() error { return nil }
 
 type fakeSlotSource struct{ slotVal uint64 }
