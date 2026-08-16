@@ -41,6 +41,18 @@ const (
 const (
 	targetUtilization = 0.5  // healthy disclosure queue = half full
 	adjustmentFactor  = 0.25 // caps a single step at +/-12.5% when Delta=+/-0.5
+
+	// adaptiveQueueCap is the Q_cap the controller normalizes the disclosure
+	// backlog against (U_cur = backlog / adaptiveQueueCap). It is deliberately
+	// small and O(disclosureDelay): the healthy in-flight backlog is ~d+1
+	// disclosures (each held d slots before release), so with cap 8 a healthy
+	// system sits at U~=0.4 (gently biased toward Tmin / low latency), and any
+	// transmission stall that pushes the backlog past 4 crosses the 0.5 target
+	// and drives Tcur up. The old signal used cap(disclosureMessages)=1024,
+	// against which the real backlog (~2) is U~=0.002 -> the controller could
+	// only ever ratchet down to Tmin. This is the miscalibration that made the
+	// toggle inert.
+	adaptiveQueueCap = 8
 )
 
 // networkDelaySlack is the delta_net term in the receiver's premature-
@@ -98,7 +110,16 @@ type RCD struct {
 	startTime      time.Time
 
 	disclosureMessages chan DisclosurePayload
-	receivedHMACs      sync.Map // [32]byte -> time.Time (local receipt time)
+
+	// disclosureBacklog is the true Q_len the adaptive controller reads:
+	// disclosures produced (enqueued) but not yet transmitted, counting BOTH
+	// the hand-off channel AND disclosureWorker's local pending slice.
+	// len(disclosureMessages) alone is useless as a signal because the worker
+	// drains the whole channel into that local slice every tick, so the
+	// channel is ~empty at every sample. Accessed atomically.
+	disclosureBacklog int64
+
+	receivedHMACs sync.Map // [32]byte -> time.Time (local receipt time)
 	commitmentKeys     sync.Map
 	senderTiming       sync.Map // uuid.UUID -> timingInfo, adaptive mode only
 
@@ -482,8 +503,14 @@ func selectNextDuration(qlen, qcap int, tCur, tMin, tMax uint64) uint64 {
 // log.Printf) so the line survives benchmarking mode, where log output is
 // discarded but stdout is captured by the harness.
 func (r *RCD) adjustSlotDuration() {
-	qlen := len(r.disclosureMessages)
-	qcap := cap(r.disclosureMessages)
+	// Q_len is the true disclosure backlog (channel + worker pending), not the
+	// hand-off channel occupancy, which is drained to ~0 every tick. Q_cap is
+	// the small, O(disclosureDelay) capacity that makes U_cur reachable.
+	qlen := int(atomic.LoadInt64(&r.disclosureBacklog))
+	if qlen < 0 {
+		qlen = 0
+	}
+	qcap := adaptiveQueueCap
 	tCur := r.adaptiveSource.GetDuration()
 	tNext := selectNextDuration(qlen, qcap, tCur, r.tMin, r.tMax)
 	r.adaptiveSource.SetDuration(tNext)
@@ -638,6 +665,7 @@ func (r *RCD) broadcastDeterministic(data []byte) error {
 		Key:        keyArray,
 		TargetSlot: targetSlot,
 	}:
+		atomic.AddInt64(&r.disclosureBacklog, 1)
 	default:
 		// Queue full, drop disclosure to avoid blocking
 		return fmt.Errorf("disclosure queue full")
@@ -724,6 +752,7 @@ func (r *RCD) flushBatch(slot uint64) error {
 		Key:        keyArray,
 		TargetSlot: targetSlot,
 	}:
+		atomic.AddInt64(&r.disclosureBacklog, 1)
 	default:
 		return fmt.Errorf("disclosure queue full")
 	}
@@ -754,6 +783,10 @@ func (r *RCD) disclosureWorker() {
 					readyIdx = i
 					break
 				}
+				// This disclosure is leaving the backlog (transmitted or
+				// dropped on a marshal error below — either way it is no
+				// longer pending), so retire it from the gauge exactly once.
+				atomic.AddInt64(&r.disclosureBacklog, -1)
 				disclosureMsg := message.NewMessage(
 					r.id,
 					currentSlot,
