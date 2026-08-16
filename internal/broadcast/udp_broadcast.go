@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"time"
 )
 
 // UDPConfig holds configuration for UDP broadcasting
@@ -12,6 +13,16 @@ type UDPConfig struct {
 	BroadcastAddr string // Address to broadcast to (e.g., "255.255.255.255:8888")
 	ListenAddr    string // Address to listen on (e.g., ":8888")
 	BufferSize    int    // Size of the receive buffer
+
+	// RadioBytesPerSec models a constrained RCD radio by blocking each
+	// Broadcast for the modelled transmission time (len(data)/rate) before
+	// the send. This is what turns the disclosure pipeline into the real
+	// bottleneck the adaptive controller relieves: when the radio cannot
+	// keep up, disclosureWorker stalls here, the disclosure backlog grows,
+	// and the queue-utilization signal finally moves. <=0 disables the
+	// throttle (default), preserving the original unthrottled behavior and
+	// removing the Linux-`tc`-only dependency for reproducing the toggle.
+	RadioBytesPerSec int
 }
 
 // DefaultUDPConfig returns a configuration with sensible defaults
@@ -33,9 +44,10 @@ func DefaultUDPConfig() UDPConfig {
 
 // UDPBroadcaster implements the Broadcaster interface using UDP
 type UDPBroadcaster struct {
-	conn *net.UDPConn
-	addr *net.UDPAddr
-	mu   sync.Mutex
+	conn             *net.UDPConn
+	addr             *net.UDPAddr
+	mu               sync.Mutex
+	radioBytesPerSec int // <=0 disables throttling
 }
 
 // NewUDPBroadcaster creates a new UDP broadcaster
@@ -58,8 +70,9 @@ func NewUDPBroadcaster(config UDPConfig) (*UDPBroadcaster, error) {
 	}
 
 	return &UDPBroadcaster{
-		conn: conn,
-		addr: addr,
+		conn:             conn,
+		addr:             addr,
+		radioBytesPerSec: config.RadioBytesPerSec,
 	}, nil
 }
 
@@ -75,6 +88,19 @@ func (b *UDPBroadcaster) Broadcast(ctx context.Context, data []byte) error {
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// Model a constrained radio: block for the transmission time at the
+	// configured rate before sending. Held under b.mu so a shared radio
+	// serializes all senders (data, HMAC, key disclosure) through the same
+	// budget, which is what lets the disclosure backlog build under load.
+	if b.radioBytesPerSec > 0 {
+		txTime := time.Duration(len(data)) * time.Second / time.Duration(b.radioBytesPerSec)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(txTime):
+		}
+	}
 
 	_, err := b.conn.Write(data)
 	return err

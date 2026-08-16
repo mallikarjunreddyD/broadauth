@@ -146,6 +146,13 @@ type Config struct {
 	TMin        uint64 // ms
 	TMax        uint64 // ms
 	MessageRate int    // packets/sec for the traffic generator
+
+	// RadioBytesPerSec throttles the shared broadcast radio (data + HMAC +
+	// key disclosure) to model a constrained RCD link. <=0 leaves the radio
+	// unthrottled (default). A tight budget is what makes the disclosure
+	// backlog — and therefore the adaptive controller — actually respond to
+	// load, without needing Linux `tc` shaping.
+	RadioBytesPerSec int
 }
 
 // timingInfo caches a sender's disclosure delay and Tmin, fetched once from
@@ -170,7 +177,9 @@ func New(cfg Config) (*RCD, error) {
 		return nil, fmt.Errorf("failed to instantiate contract: %v", err)
 	}
 
-	broadcaster, err := broadcast.NewUDPBroadcaster(broadcast.DefaultUDPConfig())
+	bcastCfg := broadcast.DefaultUDPConfig()
+	bcastCfg.RadioBytesPerSec = cfg.RadioBytesPerSec
+	broadcaster, err := broadcast.NewUDPBroadcaster(bcastCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create broadcaster: %v", err)
 	}

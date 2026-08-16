@@ -29,6 +29,7 @@ func main() {
 	tMin := flag.Uint64("tmin", 1000, "Adaptive mode: minimum slot duration in ms")
 	tMax := flag.Uint64("tmax", 8000, "Adaptive mode: maximum slot duration in ms")
 	msgRate := flag.Int("msg-rate", 50, "Traffic generator rate in packets/sec")
+	radioBps := flag.Int("radio-bps", 0, "Throttle the broadcast radio to this many bytes/sec (<=0 = unthrottled). A tight budget makes the disclosure backlog, and thus the adaptive toggle, respond to load without Linux tc.")
 
 	flag.Parse()
 
@@ -68,6 +69,7 @@ func main() {
 		TMin:               *tMin,
 		TMax:               *tMax,
 		MessageRate:        *msgRate,
+		RadioBytesPerSec:   *radioBps,
 	}
 
 	r, err := rcd.New(cfg)
