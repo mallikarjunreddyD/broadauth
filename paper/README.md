@@ -10,7 +10,9 @@ No LaTeX toolchain is installed locally. Easiest path:
 
 1. **Overleaf** — create a project, upload `prob-adaptive-inf-tesla.tex` and the
    `figures/` folder, set the compiler to pdfLaTeX. It uses only stock packages
-   (`IEEEtran`, `amsmath`, `algorithm`, `algpseudocode`, `graphicx`, `booktabs`).
+   (`IEEEtran`, `amsmath`, `algorithm`, `algorithmic`, `graphicx`, `booktabs`,
+   `amsthm`). The four figures it needs are `fig_slot_budget.png`,
+   `fig_backlog.png`, `fig_verification.png`, `fig_timeseries.png`.
 2. **Local** (after `brew install --cask mactex-no-gui` or `tlmgr`):
    ```bash
    cd paper && pdflatex prob-adaptive-inf-tesla.tex && pdflatex prob-adaptive-inf-tesla.tex

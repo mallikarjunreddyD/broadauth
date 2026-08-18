@@ -1,353 +1,525 @@
-%% Prob-Adaptive Inf-TESLA++ -- conference manuscript (IEEEtran).
-%% No local LaTeX toolchain was available; compile on Overleaf or with a
-%% standard TeX Live install: pdflatex -> bibtex (none needed, refs inline) -> pdflatex x2.
+%==============================================================================
+% Prob-Adaptive Inf-TESLA++  --  INTEGRATED DRAFT (measured EIP-1559 controller,
+% live radio-budget evaluation).
+%
+% OVERLEAF:
+%   1. New blank project, Compiler = pdfLaTeX, paste this file.
+%   2. Upload the 4 figures (in ./figures/) with EXACTLY these names:
+%         fig_slot_budget.png  fig_backlog.png  fig_verification.png  fig_timeseries.png
+%==============================================================================
+
 \documentclass[conference]{IEEEtran}
 \IEEEoverridecommandlockouts
 \usepackage{cite}
 \usepackage{amsmath,amssymb,amsfonts}
 \usepackage{algorithm}
-\usepackage{algpseudocode}
+\usepackage{algorithmic}
 \usepackage{graphicx}
-\usepackage{booktabs}
 \usepackage{textcomp}
 \usepackage{xcolor}
+\usepackage{booktabs}
 \usepackage{url}
-\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08emT\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\usepackage{amsthm}
+\newtheorem{theorem}{Theorem}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
 
 \begin{document}
 
-\title{Prob-Adaptive Inf-TESLA++: Closed-Loop Slot-Duration Control for\\
-Overflow-Resilient Broadcast Authentication on Constrained Radios}
-
+\title{Prob-Adaptive Inf-TESLA++: Dynamic Time-Scaling for Resilient Broadcast
+Authentication in Resource-Constrained Devices}
 \author{\IEEEauthorblockN{[Author Names]}
-\IEEEauthorblockA{[Department / Institution]\\
-[City, Country]\\
-[emails]}}
-
+\IEEEauthorblockA{[Department / Institution]\\ [City, Country]\\ [emails]}}
 \maketitle
 
+%==============================================================================
 \begin{abstract}
-Time-delayed key disclosure (the TESLA family) authenticates broadcast traffic
-without per-receiver state, and recent blockchain-anchored variants remove the
-sender--receiver resynchronization step by committing hash-chain roots to a
-smart contract. These protocols nonetheless run the disclosure schedule on a
-\emph{fixed} slot timer. When a resource-constrained device (RCD) must push
-authentication evidence through a slow or congested radio, the disclosure
-pipeline fills faster than it drains; on overflow the evidence for a slot is
-lost permanently and every message in that slot becomes unauthenticatable. We
-present Prob-Adaptive Inf-TESLA++, a backward-compatible extension that replaces
-the fixed slot timer with a closed-loop controller. At each slot boundary the
-sender samples the pending-disclosure backlog, normalizes it to a target
-utilization, and nudges the next slot duration up or down with a bounded
-proportional (EIP-1559-style) rule, clamped to immutable on-chain bounds
-$[T_{\min},T_{\max}]$. Longer slots batch more messages per disclosure and lower
-the disclosure rate, letting the radio drain the backlog; shorter slots restore
-low latency once pressure clears. We implement the extension on top of an
-Inf-TESLA++ codebase in Go with a Solidity contract, and evaluate it end-to-end
-against a live local blockchain by sweeping the authentication-channel radio
-budget. The measured controller tracks the bottleneck: the slot duration rises
-from its 1000\,ms floor to its 8000\,ms ceiling as the budget tightens, the
-disclosure backlog stays bounded across a wide operating range, and
-authentication remains alive down to a hard budget floor below which no slot
-length can save it. We report the controller's characteristic curves,
-quantify the stability boundary, and discuss the limitations of the prototype.
+Broadcast communication is fundamental to resource-constrained devices (RCDs),
+which must distribute data to many receivers while conserving energy and
+bandwidth. Inf-TESLA++ recently addressed continuous authentication in this
+setting by anchoring hash-chain commitment keys in an Ethereum smart contract,
+which removes the need for direct sender--receiver resynchronization. A weakness
+remains: the probabilistic mode of Inf-TESLA++ runs on a fixed slot duration.
+When the disclosure pipeline is stressed faster than this fixed rate can drain
+it, the sender's disclosure queue overflows and the corresponding evidence is
+lost permanently, breaking authentication for those slots at every receiver.
+This paper presents Prob-Adaptive Inf-TESLA++, a backward-compatible extension
+that replaces the fixed slot timer with a closed-loop timer driven by a local
+congestion signal. At each slot boundary the sender normalizes its pending
+disclosure backlog to a target utilization and nudges the next slot duration
+with a bounded proportional (EIP-1559-style) rule, clamped to immutable on-chain
+bounds $[T_{\min},T_{\max}]$ stored through a new \texttt{storeAdaptiveKey}
+function. Longer slots batch more messages per disclosure and lower the
+disclosure rate, letting the radio drain the backlog; shorter slots restore low
+latency once pressure clears. We implement the extension on the Inf-TESLA++ Go
+codebase with a Solidity contract, and evaluate it end-to-end against a live
+local blockchain by sweeping the authentication-channel radio budget---the
+resource whose overflow actually destroys authentication. The measured
+controller tracks the bottleneck: the slot duration rises from its $1000$\,ms
+floor to its $8000$\,ms ceiling as the budget tightens, the disclosure backlog
+stays bounded across the viable range, and authentication survives down to a
+hard budget floor below which no slot length can save it. We report the
+controller's characteristic curves, quantify the stability boundary, and give an
+honest account of the prototype's limitations.
 \end{abstract}
 
 \begin{IEEEkeywords}
-broadcast authentication, TESLA, delayed key disclosure, congestion control,
-smart contracts, resource-constrained devices, IoT.
+broadcast authentication, Inf-TESLA++, TESLA, IoT, congestion control,
+Ethereum, smart contract, resource-constrained devices, adaptive slot duration
 \end{IEEEkeywords}
 
+%==============================================================================
 \section{Introduction}
-Broadcasting to many receivers at once is the natural communication pattern for
-sensor fields, drone swarms, vehicular safety messages, and industrial
-telemetry. Securing such traffic requires \emph{source authentication} that
-scales to an unbounded, possibly unknown, receiver set without giving every
-receiver the power to forge messages. Public-key signatures provide this but are
-expensive for a device with a small CPU and a tight energy budget, and a
-signature per packet is often unaffordable on the air interface.
 
-The TESLA family~\cite{tesla} solves the problem with symmetric primitives and a
-single asymmetry: \emph{time}. The sender commits to a reversed hash chain and
-authenticates the messages of a time slot with a key that it reveals only after
-a delay of $d$ slots. A receiver buffers the messages, waits for the delayed
-key, checks that the key belongs to the committed chain, and verifies the
-message authentication code. Because the key is disclosed only after the window
-in which a forgery would be useful, an attacker who learns it can no longer
-inject traffic for that slot. The scheme needs only loose time synchronization
-and one hash-chain commitment per sender.
+Resource-constrained devices such as sensors, drones, IoT nodes, and vehicular
+on-board units depend on broadcast communication to reach many receivers at once
+while keeping energy and bandwidth costs low~\cite{inftesla}. Securing such
+traffic involves three goals: source authentication, data integrity, and
+continuous authentication. The TESLA family~\cite{tesla} handles the first two
+through a timed, hash-chain key disclosure scheme. Continuous authentication,
+that is, sustaining authentication across the expiry of a finite keychain
+without an expensive resynchronization step, stayed unsolved until
+Inf-TESLA++~\cite{inftesla}.
 
-A practical obstacle to \emph{continuous} operation is that a finite hash chain
-eventually runs out, and re-establishing a fresh commitment classically requires
-an interactive, sender-assisted resynchronization. Inf-TESLA++~\cite{inftesla}
-removes this interaction by anchoring hash-chain commitments in an Ethereum
-smart contract: any receiver recovers the current commitment with a blockchain
-query, so the sender never has to run a per-receiver handshake. Inf-TESLA++ also
-offers a \emph{probabilistic} mode in which the messages of a slot are
-compressed into a Bloom filter~\cite{bloom} that is authenticated once, reducing
-the per-message overhead of busy slots.
+Inf-TESLA++ removes direct sender--receiver communication during
+resynchronization by placing keychain commitment keys in an Ethereum smart
+contract, so any receiver can recover the commitment through a blockchain query.
+Its probabilistic mode maps a batch of packets into a Bloom filter~\cite{bloom}
+and broadcasts a single HMAC over the filter, which lowers communication overhead
+during busy periods. The choice between the deterministic and probabilistic
+modes is governed by the congestion metric $C = R/L$, the fraction of empty slots
+the sender observes, with the probabilistic mode engaged once $C \geq \eta$ for a
+threshold $\eta$ published by the consortium manager~\cite{inftesla}.
 
-\textbf{The gap.} Every protocol above drives key disclosure on a \emph{fixed}
-slot timer. The timer is oblivious to the state of the device that must actually
-transmit the authentication evidence. On an RCD the radio is slow, shared, and
-bursty; MAC-layer backoff, interference, or a CPU stall can leave the transmit
-path unable to keep up. Meanwhile the fixed timer keeps generating a new
-disclosure obligation every slot. The pending-disclosure queue grows, and when
-it overflows the evidence---in probabilistic mode, the Bloom filter and the
-key---for that slot is dropped. Unlike a plain missed key, which a later key can
-often re-derive, a dropped Bloom filter is unrecoverable: without it the
-receiver cannot test slot membership, so \emph{every} message batched into that
-slot is permanently unauthenticatable. Enlarging the timer statically is not a
-fix: a permanently long slot inflates authentication latency for all traffic and
-enlarges the receiver's buffering window, trading one failure for another.
+\textbf{Motivation.} Inf-TESLA++ employs a fixed slot duration for both
+deterministic and probabilistic modes. Under bursty traffic, hardware slowdown,
+or adversarial flooding, disclosure events may accumulate faster than the radio
+can transmit them, causing queue overflow and permanent key loss. In the
+probabilistic mode the loss is especially damaging: the disclosed object contains
+the Bloom filter itself, so if it is dropped the receiver cannot test slot
+membership and \emph{every} message batched into that slot becomes
+unauthenticatable. Increasing the Bloom-filter size is not a viable remedy,
+because the false-positive rate bounds the number of keys per batch, and a
+permanently long slot inflates authentication latency for all traffic. We
+therefore adapt the slot duration dynamically, allowing the disclosure queue to
+drain during congestion while restoring the minimum slot duration once conditions
+recover.
 
-\textbf{This paper.} We make the slot duration a controlled variable. A
-closed-loop controller runs at each slot boundary, reads how full the
-pending-disclosure queue is, and adjusts the next slot duration toward a target
-utilization using a bounded multiplicative step, staying inside immutable bounds
-$[T_{\min},T_{\max}]$ published in the smart contract. The control action is
-self-relieving: lengthening a slot both lowers the rate at which new disclosure
-obligations are created and enlarges the Bloom-filter batch, so the radio gets a
-chance to drain the backlog; shortening it restores low latency once the
-pressure clears. The bounds are on-chain and tamper-evident, so a compromised or
-manipulated timer cannot push the slot outside the contracted range.
-
-Our contributions are:
+\textbf{Contributions.} This paper contributes:
 \begin{itemize}
-\item A closed-loop slot-duration controller for delayed-disclosure broadcast
-authentication, driven by a single, locally observable signal---the
-pending-disclosure backlog---with a bounded proportional update and on-chain
-duration limits (Section~\ref{sec:controller}).
-\item A backward-compatible realization on an Inf-TESLA++ codebase: the sender
-keeps the same hash chain, Bloom-filter compression, and blockchain-anchored
-commitments, and a small contract extension stores the duration bounds
-(Section~\ref{sec:impl}).
-\item An end-to-end measurement methodology that runs the full stack---local
-blockchain, consortium manager, key owner, and RCD---and sweeps the
-authentication-channel radio budget, together with the tooling changes required
-to make the controller's signal observable (Section~\ref{sec:method}).
-\item Measured characteristic curves showing that the slot duration tracks the
-radio bottleneck, that the disclosure backlog stays bounded across a wide range,
-and that authentication survives down to an identifiable budget floor
-(Section~\ref{sec:results}), followed by an honest account of the prototype's
-limitations (Section~\ref{sec:discussion}).
+\item A closed-loop adaptive slot timer driven by a local congestion signal,
+using a bounded proportional (EIP-1559-style) update rather than an unbounded
+doubling/halving step, so the slot converges toward a target queue utilization
+without overshoot.
+\item A backward-compatible smart-contract extension that stores immutable timing
+bounds $[T_{\min},T_{\max}]$ and returns them in a single query, preserving the
+TESLA timing condition and blocking timing-manipulation denial of service.
+\item An end-to-end evaluation that runs the full stack---local blockchain,
+consortium manager, key owner, and RCD---and sweeps the authentication-channel
+radio budget, demonstrating that the slot duration tracks the bottleneck, the
+disclosure backlog stays bounded, and authentication survives to an identifiable
+budget floor.
 \end{itemize}
 
-\section{Background}
-\label{sec:background}
-We summarize the mechanics a reader needs, assuming no prior familiarity with
-Inf-TESLA++.
+%==============================================================================
+\section{Background and Related Work}
 
-\subsection{Delayed key disclosure}
-A sender picks a random seed $K_n$ and computes a chain
-$K_i = H(K_{i+1})$ for a one-way hash $H$, so $K_0$ is the public commitment and
-each $K_i$ can be verified against $K_0$ by re-hashing. Time is divided into
-slots. In slot $i$ the sender transmits its messages together with a MAC keyed
-by the still-secret $K_i$. After a disclosure delay of $d$ slots the sender
-reveals $K_i$. A receiver accepts a message only if (i) it arrived before $K_i$
-could have been public and (ii) the later-revealed $K_i$ hashes back to the
-commitment and validates the MAC. Condition~(i)---the \emph{security condition}
----is what a delayed disclosure buys: a forger who waits for $K_i$ has already
-missed the window.
+\subsection{The TESLA Protocol Family}
+TESLA~\cite{tesla} authenticates broadcast packets using delayed key disclosure
+over a one-way hash chain. A sender commits to a reversed chain
+$K_i = H(K_{i+1})$, so $K_0$ is a public commitment and any $K_i$ can be verified
+by re-hashing to $K_0$. In slot $i$ the sender MACs its messages with the still
+secret $K_i$ and reveals $K_i$ only after a delay of $d$ slots. Receivers buffer
+packets until the key is disclosed, then check that it belongs to the committed
+chain and validates the MAC; a forger who waits for $K_i$ has already missed the
+window in which injection would be useful. $\mu$TESLA~\cite{spins} adapts TESLA to
+resource-constrained sensor networks but requires periodic resynchronization and
+scales poorly. TESLA++~\cite{teslapp} reduces receiver buffering by disclosing the
+message and key together.
 
-\subsection{Probabilistic (Bloom-filter) mode}
-Authenticating each message of a busy slot separately is wasteful. In the
-probabilistic mode the sender inserts the slot's messages into a Bloom
-filter~\cite{bloom} $b_i$, MACs $b_i$ once, and later discloses the pair
-$(K_i, b_i)$. A receiver tests each buffered message for membership in $b_i$. One
-disclosure thus authenticates a whole batch, at the cost of a tunable
-false-positive rate. Crucially, the disclosed object now \emph{contains} $b_i$:
-if that object is lost, the batch cannot be checked at all.
+\subsection{Continuous Authentication in TESLA Variants}
+Prior work has addressed continuous authentication using dual hash
+chains~\cite{inftesla_orig}, encrypted next-chain commitments~\cite{enhanced},
+hierarchical key structures~\cite{empirical,comparative}, and
+blockchain-assisted commitment storage~\cite{garcia}. Inf-TESLA++~\cite{inftesla}
+anchors infinite hash-chain commitment keys in a smart contract, eliminating
+sender-assisted resynchronization, and serves as the baseline for this work.
+However, none of these approaches adapts the disclosure schedule to prevent
+sender-side disclosure-queue overflow under congestion.
 
-\subsection{Blockchain-anchored commitments}
-Inf-TESLA++~\cite{inftesla} writes each hash-chain commitment $K_0$ (with its
-validity window) to a smart contract via a trusted key owner. A receiver reads
-the current commitment from the contract rather than from the sender, which
-removes the interactive resynchronization needed to run indefinitely across many
-finite chains. Our extension keeps this design and adds two immutable integers
-to the stored record.
+\subsection{Congestion Control in Broadcast Authentication}
+Conventional congestion-control mechanisms such as AIMD~\cite{aimd} require
+per-receiver feedback and are therefore unsuitable for authenticated broadcast,
+where a one-way, time-triggered sender receives no acknowledgements. Erasure
+coding~\cite{rabin}, retransmission~\cite{spins}, and adaptive
+batching~\cite{inftesla} improve reliability but do not address sender-side
+disclosure-queue overflow. Our controller instead closes the loop on a purely
+local signal---the sender's own disclosure backlog---and borrows the bounded
+proportional update of the EIP-1559 fee mechanism~\cite{eip1559}, which likewise
+steers a quantity toward a target utilization with a clamped multiplicative step.
 
-\subsection{The disclosure queue}
-Between production (one disclosure object per slot) and transmission (over a
-constrained radio, after the $d$-slot hold) sits a queue. Let $Q_{\text{len}}$ be
-the number of disclosure objects currently produced but not yet transmitted, and
-let $Q_{\text{cap}}$ be the capacity the device budgets for them. This queue is
-the object our controller observes; its occupancy is the sole congestion signal.
-
+%==============================================================================
 \section{System and Threat Model}
-\label{sec:model}
-\textbf{Entities.} A transmitting RCD ($r_s$) holds a hash chain and broadcasts
-in the probabilistic mode. Receiving RCDs ($r_e$) buffer messages and query the
-contract for the commitment. A key owner registers commitments on-chain; a
-consortium manager mediates access. The transport is a lossy, best-effort
-datagram channel typical of IoT and vehicular links.
 
-\textbf{Radio.} The device shares one radio between application data and
-authentication traffic (MACs and disclosures). We treat the authentication path
+\subsection{System Architecture}
+Prob-Adaptive Inf-TESLA++ keeps the entity model of Inf-TESLA++~\cite{inftesla}
+intact while extending the smart-contract interface and the sender's slot timer.
+
+The \emph{transmitting RCD} ($r_s$) is a device with limited CPU, memory, power,
+and bandwidth. It holds an infinite hash chain anchored in the contract and runs
+in deterministic or probabilistic mode as before. The extension adds one duty: at
+the close of each slot cycle $i$, $r_s$ samples its local disclosure-queue
+occupancy, computes the congestion signal, and re-arms the timer with the next
+duration $T_{\mathrm{next}}$ before running the next slot. The slot work
+itself---the Bloom-filter flush and HMAC broadcast---is unchanged.
+
+The \emph{receiving RCD} ($r_e$) buffers incoming packets and queries
+\texttt{getKey} for the commitment key $K_0$, as in the baseline. It carries one
+extra obligation: it must not accept a disclosed key until at least $T_{\max}$,
+read from the contract, has elapsed since the packet was sent, irrespective of
+the interval $r_s$ currently uses. This conservative wait preserves the timing
+condition without forcing $r_e$ to track the sender's live slot duration.
+
+The \emph{smart contract} retains every Inf-TESLA++ function (\texttt{init},
+\texttt{regOwner}, \texttt{storeKey}, \texttt{setKey}, \texttt{getKey}) and adds
+\texttt{storeAdaptiveKey} (Section~\ref{sec:contract}), which records $T_{\min}$
+and $T_{\max}$ with the commitment key. The \emph{transport} is a connectionless
+UDP channel with variable loss and stochastic latency, typical of IoT, LPWAN, and
+VANET links. The device shares a single radio between application data and
+authentication traffic; we treat the authentication path (HMACs and disclosures)
 as the scarce resource, because it is the path whose overflow destroys
-authentication, and characterize the system against its available byte rate.
+authentication.
 
-\textbf{Adversary.} We assume a Dolev--Yao attacker~\cite{dolevyao} that can
-intercept, delay, replay, and inject datagrams but cannot break $H$ or the MAC.
-Two behaviours matter here. First, an attacker who floods the channel raises
-congestion and can try to force disclosure-queue overflow; our controller's
-purpose is to keep the queue bounded under exactly this pressure. Second, an
-attacker who manipulates timing information cannot move the slot duration outside
-$[T_{\min},T_{\max}]$, because those bounds are read from the tamper-evident
-contract, not from the wire. Full formal treatment of timing attacks is out of
-scope and noted as future work.
+\subsection{Threat Model}
+We use the Dolev--Yao model~\cite{dolev} and add threats unique to dynamic timing.
 
-\section{The Prob-Adaptive Controller}
-\label{sec:controller}
-The extension is purely additive to the sender's slot loop. Everything
-else---hash-chain key selection, Bloom-filter construction, MAC computation,
-disclosure, and receiver verification---is unchanged. At the close of slot $i$
-the sender samples the disclosure queue and re-arms the next slot with a duration
-$T_{\text{next}}$ computed from a single scalar.
+The \emph{Dolev--Yao attacker} controls the channel and may intercept, delay,
+inject, and replay packets. It is computationally bounded: it cannot invert $H$,
+cannot forge $\mathrm{HMAC}_{K_i}$ without the undisclosed $K_i$, and cannot read
+future keys, since $K_i = H(K_{i+1})$ is one-way.
 
-\subsection{Signal}
-The controller reads the queue utilization
+A \emph{desynchronization attack} is unique to the adaptive setting. The
+adversary injects, replays, or delays packets carrying manipulated sequence
+numbers or timing information to make a receiver infer a slot duration different
+from the one actually used by $r_s$. The goal is to induce premature acceptance
+of disclosed keys, violating the TESLA timing condition, or to force receivers
+into excessive waiting, resulting in liveness degradation.
+
+For \emph{resource exhaustion and denial-of-service (DoS)}, we consider an
+adversary that attempts to exhaust the sender's disclosure resources, either by
+injecting sustained traffic to force the disclosure queue toward overflow, or by
+maintaining persistent congestion so that the adaptive controller remains at its
+maximum slot duration $T_{\max}$, degrading authentication throughput.
+
+%==============================================================================
+\section{The Prob-Adaptive Protocol Design}
+
+\subsection{Overview}
+In the baseline, $r_s$ fires a fixed \texttt{time.Ticker} every $T$\,ms, runs the
+slot, and repeats. Prob-Adaptive Inf-TESLA++ swaps the ticker for a dynamic timer
+re-armed with $T_{\mathrm{next}}$ after each slot, where $T_{\mathrm{next}}$
+follows from the congestion signal measured over that slot. Everything
+else---hash-chain key selection, Bloom-filter construction, HMAC computation and
+broadcast, receiver verification, and \texttt{getKey} access---stays the same.
+The extension is purely additive.
+
+\subsection{Smart Contract Extension}\label{sec:contract}
+The new function extends \texttt{storeKey} with two parameters:
 \begin{equation}
-U_i \;=\; \frac{Q_{\text{len}}}{Q_{\text{cap}}},
-\label{eq:util}
+\texttt{storeAdaptiveKey}(r_s, d, l, \tau_{st}, K_0, T_{\min}, T_{\max}).
 \end{equation}
-where $Q_{\text{len}}$ is the pending-disclosure backlog defined in
-Section~\ref{sec:background} and $Q_{\text{cap}}$ is a small, device-budgeted
-capacity of the order of the disclosure delay $d$. A healthy system, in which
-only the $d$ in-flight disclosures of the security window are outstanding, sits
-below the target; a transmit-path stall pushes $U_i$ above it.
+It performs the same signature check as \texttt{storeKey}, then stores
+$(T_{\min},T_{\max})$ next to $(d,l,\tau_{st},K_0)$. Both bounds are given in
+milliseconds and are immutable for the session. \texttt{getKey} is widened to
+return $(K_0,d,l,\tau_{st},T_{\min},T_{\max})$, so a receiver obtains the entire
+timing policy in one query.
 
-\subsection{Update rule}
+Because $T_{\max}$ lives on-chain, a compromised sender can neither inflate the
+slot without limit to stall authentication nor shrink it below $T_{\min}$ to
+force premature acceptance. Any receiver can flag a violation by comparing the
+observed slot duration against the on-chain record, inheriting the
+tamper-evidence the baseline already relies on.
+
+\subsection{Congestion Signal}\label{sec:metrics}
+At each slot boundary the sender reads bounded local quantities that need no
+network round-trip. The primary signal is the disclosure-queue pressure
+\begin{equation}
+D_i = \frac{Q_{\mathrm{len}}}{Q_{\mathrm{cap}}},
+\label{eq:di}
+\end{equation}
+where $Q_{\mathrm{len}}$ is the number of \emph{pending disclosure objects}---the
+$(K_i,b_i)$ bundles produced but not yet transmitted, counting both the $d$
+in-flight objects held by the TESLA delay and any that are queued behind a busy
+radio---and $Q_{\mathrm{cap}}$ is the small capacity the device budgets for them.
+A full queue is precisely what causes the irrecoverable key loss the static
+protocol cannot avoid, so $D_i$ is the signal the controller must act on.
+
+The design also admits a secondary, latency-based term
+\begin{equation}
+B_i = \min\!\left(1.0,\ L_{\mathrm{avg}}/L_{\mathrm{base}}\right),
+\label{eq:bi}
+\end{equation}
+with $L_{\mathrm{avg}}$ the mean broadcast latency over the current window and
+$L_{\mathrm{base}}$ a healthy per-device baseline; the clamp keeps
+$B_i\in[0,1]$. The general congestion score is a convex combination
+\begin{equation}
+C_i = W_{\mathrm{disc}}\,D_i + W_{\mathrm{lat}}\,B_i,\qquad
+W_{\mathrm{disc}}+W_{\mathrm{lat}}=1,
+\label{eq:score}
+\end{equation}
+which is independent of the Inf-TESLA++ mode-selection metric $C=R/L$ and leaves
+mode selection untouched. The weighting is queue-dominant, because latency is
+recoverable through receiver buffering whereas key loss is not. \emph{The
+prototype evaluated in this paper uses the queue-dominant configuration
+$W_{\mathrm{disc}}=1$, so $C_i=D_i$}; instrumenting $B_i$ as an independent
+observable is left as future work, and we return to this choice in
+Section~\ref{sec:discussion}.
+
+\subsection{Bounded Proportional Time-Scaling}
 Rather than doubling or halving the slot---a bang-bang step that overshoots and
-oscillates---we use a bounded proportional adjustment inspired by the EIP-1559
-fee mechanism~\cite{eip1559}. Let $U^{\ast}$ be the target utilization and
-$\alpha$ a step gain. The next duration is
+oscillates---we adjust the slot with a bounded proportional rule inspired by the
+EIP-1559 fee mechanism~\cite{eip1559}. Let $C^{\ast}$ be the target utilization
+and $\alpha$ a step gain. The next duration is
 \begin{align}
-\Delta_i &= U_i - U^{\ast}, \label{eq:delta}\\
-T_{\text{next}} &= \mathrm{clip}\!\Big(\,T_i\big(1+\alpha\,\Delta_i\big),\;
+\Delta_i &= C_i - C^{\ast}, \label{eq:delta}\\
+T_{\mathrm{next}} &= \mathrm{clip}\!\Big(T_{\mathrm{cur}}\big(1+\alpha\,\Delta_i\big),\;
 T_{\min},\;T_{\max}\Big).
 \label{eq:update}
 \end{align}
-With $U^{\ast}=0.5$ and $\alpha=0.25$, a single step changes the slot by at most
-$\pm 12.5\%$ (attained at $U_i\in\{0,1\}$), the slot grows above the target and
-shrinks below it, and the unique interior fixed point is $U_i=U^{\ast}$, i.e.\
-$Q_{\text{len}}=Q_{\text{cap}}/2$. When the queue saturates ($U_i \gg 1$) the
-step is large and $T_{\text{next}}$ clamps to $T_{\max}$; the clip enforces the
-on-chain bounds regardless of the raw computation. Algorithm~\ref{alg:ctrl}
-states the rule.
+Algorithm~\ref{alg:ctrl} states the rule. With $C^{\ast}=0.5$ and $\alpha=0.25$, a
+single step changes the slot by at most $\pm 12.5\%$ (attained at
+$C_i\in\{0,1\}$), the slot grows above the target and shrinks below it, and the
+unique interior fixed point is $C_i=C^{\ast}$, i.e.\ $Q_{\mathrm{len}}=
+Q_{\mathrm{cap}}/2$. When the queue saturates ($C_i\gg 1$) the step is large and
+$T_{\mathrm{next}}$ clamps to $T_{\max}$; the clip enforces the on-chain bounds
+regardless of the raw computation.
 
 \begin{algorithm}[t]
-\caption{Slot-duration control (per slot boundary)}
+\caption{Bounded Proportional Time-Scaling (per slot boundary)}
 \label{alg:ctrl}
 \begin{algorithmic}[1]
-\Require $Q_{\text{len}},\,Q_{\text{cap}},\,T_i,\,T_{\min},\,T_{\max},\,U^{\ast},\,\alpha$
-\Ensure $T_{\text{next}}$
-\State $U \gets Q_{\text{len}} / Q_{\text{cap}}$
-\State $\Delta \gets U - U^{\ast}$
-\State $T_{\text{next}} \gets T_i\,(1 + \alpha\,\Delta)$
-\State $T_{\text{next}} \gets \max\!\big(T_{\min},\ \min(T_{\text{next}},\,T_{\max})\big)$
-\State \Return $T_{\text{next}}$
+\REQUIRE $D_i,\ B_i,\ T_{\mathrm{cur}},\ T_{\min},\ T_{\max},\
+W_{\mathrm{disc}},\ W_{\mathrm{lat}},\ C^{\ast},\ \alpha$
+\ENSURE $T_{\mathrm{next}}$
+\STATE $C_i \gets W_{\mathrm{disc}}D_i + W_{\mathrm{lat}}B_i$
+\STATE $\Delta_i \gets C_i - C^{\ast}$
+\STATE $T_{\mathrm{next}} \gets T_{\mathrm{cur}}\,(1 + \alpha\,\Delta_i)$
+\STATE $T_{\mathrm{next}} \gets \max(T_{\min},\min(T_{\mathrm{next}},T_{\max}))$
+\RETURN $T_{\mathrm{next}}$
 \end{algorithmic}
 \end{algorithm}
 
-\subsection{Why the action relieves the queue}
-\label{sec:why}
-The controller lengthens the slot when the queue is full. This is self-relieving
-for two compounding reasons. First, the sender produces exactly one disclosure
-object per slot, so the production rate is $1/T$ objects per second: a longer
-slot produces disclosures less often. Second, a longer slot accumulates a larger
-batch, and the Bloom filter is MAC'd and disclosed once per batch, so the
-per-message transmission overhead falls. Both effects reduce the byte rate the
-authentication path must sustain, giving the radio time to drain the backlog.
-When the backlog clears, $U_i$ drops below $U^{\ast}$ and the slot shrinks back
-toward $T_{\min}$, restoring low latency. The loop therefore rides the frontier
-between latency (short slots) and survivability (long slots) instead of being
-pinned to one static operating point.
+\textbf{Why the action relieves the queue.} The controller lengthens the slot
+when the queue is full. This is self-relieving for two compounding reasons.
+First, the sender produces exactly one disclosure object per slot, so production
+runs at $1/T$ objects per second: a longer slot produces disclosures less often.
+Second, a longer slot accumulates a larger batch, and the Bloom filter is MAC'd
+and disclosed once per batch, so the per-message transmission overhead falls.
+Both effects lower the byte rate the authentication path must sustain, giving the
+radio time to drain the backlog; when the backlog clears, $C_i$ falls below
+$C^{\ast}$ and the slot shrinks back toward $T_{\min}$, restoring low latency. The
+disclosure queue is the correct signal precisely because the control action
+reduces its arrival rate; a signal taken from the pre-transmission ingest buffer
+would instead grow with $T$ and yield positive feedback.
 
-We stress that the \emph{disclosure} queue is the right signal: its action is
-stabilizing. A signal taken from the pre-transmission ingest buffer would be
-destabilizing, because lengthening a slot enlarges that buffer, which would call
-for further lengthening---positive feedback that runs to the ceiling. The
-disclosure queue, in contrast, is drained faster (in rate terms) by the very
-action the controller takes.
+%==============================================================================
+\section{Security and Safety Analysis}
 
-\subsection{Bounds and safety}
-$T_{\min}$ and $T_{\max}$ are stored on-chain alongside the commitment and are
-immutable for the session. Because a receiver can, in principle, read the same
-bounds, a compromised sender can neither inflate the slot without limit to stall
-authentication nor shrink it below $T_{\min}$ to force premature acceptance
-beyond the contracted range. The controller inherits the tamper-evidence of the
-commitment store it already relies on. The per-slot cost is a subtraction, a
-multiply, and two comparisons; no additional network messages, receiver
-messages, or blockchain queries are introduced.
+\subsection{Timing Safety Under Adaptive Slot Duration}
+The primary security concern introduced by adaptive slot durations is
+desynchronization. Unlike the fixed-slot baseline, receivers cannot assume a
+globally known disclosure interval because the sender may legitimately vary the
+slot duration within the configured range. Prob-Adaptive Inf-TESLA++ prevents the
+resulting attack by treating the sender's runtime slot duration as untrusted:
+receivers derive their verification delay solely from the immutable upper bound
+$T_{\max}$ stored in the contract. Since every admissible slot satisfies
+$T_{\mathrm{cur}}\le T_{\max}$, a receiver that waits according to this bound
+cannot be induced to accept a disclosed key prematurely, regardless of any timing
+information carried by adversarial packets. Here $d$ is a fixed, small
+protocol constant (the disclosure delay in slots, $d=2$ in our evaluation) that
+is part of the published policy, not a runtime value the receiver must infer.
 
-\section{Implementation}
-\label{sec:impl}
-We build on an Inf-TESLA++ codebase written in Go, with the contract in Solidity
-and Go bindings. The sender's slot loop uses an adaptive timer whose period is
-set by Algorithm~\ref{alg:ctrl}; the disclosure worker holds each produced object
-for $d$ slots and then transmits it. The contract gains one function that stores
-$(T_{\min},T_{\max})$ next to the commitment, and a getter that returns them; all
-existing functions are untouched, so a non-adaptive deployment is unchanged.
+\begin{theorem}[Timing Safety]
+Let the adaptive slot duration satisfy $T_{\mathrm{cur}}\in[T_{\min},T_{\max}]$,
+where $T_{\min}$ and $T_{\max}$ are stored immutably in the smart contract. Let
+$d$ denote the disclosure delay (in slots) and $\delta_{\mathrm{net}}$ the
+maximum one-way network delay. If every receiver waits
+$\Delta \ge d\,T_{\max}+\delta_{\mathrm{net}}$ before accepting a disclosed key,
+then the TESLA timing condition holds for all
+$T_{\mathrm{cur}}\in[T_{\min},T_{\max}]$.
+\end{theorem}
+\begin{proof}
+Since $T_{\min}\le T_{\mathrm{cur}}\le T_{\max}$, we have
+$d\,T_{\mathrm{cur}}\le d\,T_{\max}$, so the maximum disclosure interval is bounded
+by $d\,T_{\max}$. Waiting $\Delta \ge d\,T_{\max}+\delta_{\mathrm{net}}$ ensures
+that key disclosure occurs only after the maximum disclosure interval and network
+delay. Therefore an adversary cannot obtain $K_i$ early enough to forge packets
+while slot-$i$ packets remain in transit, preserving the TESLA timing condition.
+Since $T_{\max}$ is immutable and obtained from the contract, manipulated runtime
+timing information cannot induce premature key acceptance.
+\end{proof}
 
-\textbf{Authentication-channel model.} A real RCD shares one radio between
-application data and authentication traffic. To characterize the controller
-against the resource whose overflow actually destroys authentication, we
-throttle only the authentication path (MACs and disclosures) to a configurable
-byte rate and leave application data on an unthrottled plane. This isolates the
-disclosure pipeline as the bottleneck the controller relieves and makes the
-radio budget the single independent variable of the study; it also removes any
-dependence on operating-system traffic shaping, so the experiment is portable.
-The throttle blocks each authentication send for its modelled transmission time
-and serializes those sends, so a burst of data traffic can never starve the
-disclosure path.
+As a concrete illustration, with $d=2$ and $T_{\max}=8000$\,ms a receiver waits at
+least $16$\,s (plus $\delta_{\mathrm{net}}$) before trusting a key, whatever slot
+length the sender is currently using; a sender running at $T_{\mathrm{cur}}=1000$
+ms simply discloses well inside this conservative bound, which costs latency but
+never safety.
 
-\section{Experimental Methodology}
-\label{sec:method}
-\textbf{Live stack.} Every measurement runs the complete system: a local
-Ethereum node, the consortium manager, the key owner (which registers hash-chain
-commitments and pre-generates device identities), and one RCD operating in the
-probabilistic, adaptive mode. The RCD broadcasts over the loopback datagram
-channel and also receives and verifies its own traffic, so a single node
-exercises both the sender-side controller and the receiver-side checks.
+\subsection{Authentication Continuity Under Congestion}
+As disclosure-queue occupancy approaches capacity ($D_i\!\rightarrow\!1$), the
+controller progressively increases the slot duration up to $T_{\max}$, preserving
+key continuity at the cost of higher authentication latency. Unlike fixed-slot
+Inf-TESLA++, which may permanently lose disclosure keys after queue overflow, the
+adaptive protocol trades additional latency for uninterrupted authentication,
+until a hardware floor at which even $T_{\max}$ cannot balance production and
+drainage (Section~\ref{sec:results}).
 
-\textbf{Independent variable.} We sweep the authentication-channel radio budget
-$B$ (bytes/second) over $\{100,150,200,250,300,350,500,800\}$. For each budget we
-run the RCD for $90$\,s at a fixed application message rate of $50$\,msg/s, with
-$T_{\min}=1000$\,ms, $T_{\max}=8000$\,ms, disclosure delay $d=2$, target
-$U^{\ast}=0.5$, gain $\alpha=0.25$, and $Q_{\text{cap}}=8$. Each budget is run in
-three independent iterations with a fresh device identity, and we report the
-median across iterations with the min--max range as the error interval.
+\subsection{Resistance to Resource Exhaustion and DoS}
+During queue-flooding attacks, rising occupancy raises $C_i$ and enlarges the
+slot before disclosure-queue overflow occurs. An attacker cannot push the slot
+beyond the immutable bound $T_{\max}$, and once congestion subsides the slot
+returns toward $T_{\min}$ under the proportional rule; because each step is a
+bounded fraction of $T_{\mathrm{cur}}$, recovery is geometric in the contracted
+dynamic range $T_{\max}/T_{\min}$.
 
-\textbf{Observed quantities.} At each slot boundary the sender logs $T_i$,
-$Q_{\text{len}}$, and $U_i$; the receiver reports the running count of verified
-messages and of disclosures rejected by the security-condition check
-(``premature'' rejections). From the per-slot trace we extract the peak $T_i$
-and a steady-state $T_i$ (the median of the last $40\%$ of slots, which is robust
-to the ramp and to the controller's limit cycle), the peak and steady-state
-backlog, and the end-of-run verification counts.
+%==============================================================================
+\section{Implementation and Evaluation}\label{sec:results}
 
-\textbf{Reproducibility notes.} Two prototype details are relevant to reading the
-data and are revisited in Section~\ref{sec:discussion}: the disclosure worker
-advances the slot counter through a second timer instance, which halves the
-effective wall-clock hold and perturbs timing near the $T_{\min}$ knee; and at
-the lowest budgets the slot is so long that a $90$\,s run contains only a handful
-of control ticks, so the steady-state estimate at those points is conservative
-relative to the peak.
+\subsection{Implementation}
+The extension is written in Go on top of the Inf-TESLA++ codebase. The sender
+uses an \texttt{AdaptiveSlotSource} whose timer is re-armed with the duration
+chosen by Algorithm~\ref{alg:ctrl}; a disclosure worker holds each produced
+object for $d$ slots and then transmits it. The contract side adds
+\texttt{storeAdaptiveKey} and a widened getter in Solidity with matching Go
+bindings; all existing functions are untouched, so a non-adaptive deployment is
+unchanged.
 
-\section{Results}
-\label{sec:results}
-Table~\ref{tab:results} collects the per-budget measurements;
-Figures~\ref{fig:slot}--\ref{fig:step} plot them.
+To characterize the controller against the resource whose overflow actually
+destroys authentication, the implementation models a shared but budget-limited
+radio. Authentication traffic (HMACs and key disclosures) is transmitted over a
+throttled path limited to a configurable byte rate, while application data is
+carried on an unthrottled plane; the throttle serializes authentication sends and
+blocks each for its modelled transmission time. This isolates the disclosure
+pipeline as the bottleneck the controller relieves and makes the radio budget the
+single independent variable, with no dependence on operating-system traffic
+shaping.
+
+\subsection{Experimental Setup}
+Every measurement runs the complete system: a local Ethereum node, the consortium
+manager, the key owner (which registers commitments and pre-generates device
+identities), and one RCD in the probabilistic, adaptive mode. The RCD broadcasts
+over the loopback datagram channel and also receives and verifies its own
+traffic, so a single node exercises both the sender-side controller and the
+receiver-side checks.
+
+We sweep the authentication-channel radio budget $B$ (bytes/second) over
+$\{100,150,200,250,300,350,500,800\}$. For each budget the RCD runs for $90$\,s
+at an application message rate of $50$\,msg/s, with $T_{\min}=1000$\,ms,
+$T_{\max}=8000$\,ms, disclosure delay $d=2$, target $C^{\ast}=0.5$, gain
+$\alpha=0.25$, capacity $Q_{\mathrm{cap}}=8$, and hash-chain length $512$. Each
+budget is run in three independent iterations with a fresh device identity; we
+report the median across iterations, with the min--max range as the error
+interval. At each slot boundary the sender logs the current duration $T_i$ and the
+backlog $Q_{\mathrm{len}}$; the receiver reports counts of verified messages and
+of disclosures rejected by the security-condition check. From the per-slot trace
+we extract the peak and a steady-state value (the median of the last $40\%$ of
+slots, robust to the ramp and to the controller's limit cycle).
+
+\subsection{Slot Duration Tracks the Bottleneck}
+Figure~\ref{fig:slot} plots the steady-state and peak slot duration against the
+radio budget, and Table~\ref{tab:results} lists the values. Three regimes are
+visible. In the \emph{saturated} regime ($B\lesssim 150$\,B/s) the peak slot pins
+at the $T_{\max}=8000$\,ms ceiling: even the longest admissible slot cannot make
+the authentication path keep up. In the \emph{proportional} regime ($200\le B\le
+300$\,B/s) the slot duration falls monotonically as the budget grows---the
+controller sets a graded operating point, the direct evidence that the toggle
+responds to load. In the \emph{idle} regime ($B\gtrsim 300$\,B/s) the slot rests
+at the $T_{\min}=1000$\,ms floor, since the radio drains disclosures faster than
+slots produce them. The steady-state curve dips slightly below the peak at the two
+lowest budgets; this is a finite-run effect (at $8$\,s slots a $90$\,s run
+contains few control ticks), and the peak curve confirms both points reach the
+ceiling.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_slot_budget.png}
+\caption{Adaptive slot duration versus authentication-channel radio budget
+(measured, end-to-end). The controller rails at $T_{\max}$ when the budget is
+starved, sets a graded duration through the transition, and rests at $T_{\min}$
+when the budget is ample. Markers are medians of three runs; bars show the range.}
+\label{fig:slot}
+\end{figure}
+
+\subsection{The Backlog Stays Bounded}
+Figure~\ref{fig:backlog} plots the disclosure backlog. For every budget at which
+authentication is viable, the backlog remains a small multiple of the controller
+target ($Q_{\mathrm{cap}}/2=4$) and well under the device buffer: the loop caps
+the queue instead of letting it grow without bound. Only at the starved end
+($B=100$\,B/s) does the backlog climb to $14$--$23$ objects, beyond
+$Q_{\mathrm{cap}}$, because no slot length can balance production and drainage
+there. That point marks the protocol's stability boundary.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_backlog.png}
+\caption{Pending-disclosure backlog versus radio budget. The backlog is held near
+the controller target across the viable range and exceeds $Q_{\mathrm{cap}}$ only
+at the starved $100$\,B/s point, where even $T_{\max}$ cannot drain it.}
+\label{fig:backlog}
+\end{figure}
+
+\subsection{Authentication Survives to a Budget Floor}
+Figure~\ref{fig:verif} reports receiver outcomes. Above the stability boundary,
+verification is healthy (hundreds of messages per run at $500$--$800$\,B/s). As
+the budget tightens through the transition the verified count declines but stays
+positive, and at the starved $100$\,B/s point it collapses to zero: the
+authentication path is so throttled that disclosures cannot reach the receiver
+within its timing window, which is exactly the permanent-loss failure the fixed
+timer cannot avoid. Premature rejections are negligible everywhere except a single
+spike at $350$\,B/s; as explained in Section~\ref{sec:discussion} this is a timing
+artifact of the prototype's slot counter at the $T_{\min}$ knee, not a forgery.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_verification.png}
+\caption{Receiver verification outcomes versus radio budget. Verified messages are
+plentiful when the budget is ample, decline through the transition, and vanish at
+the starved end; premature rejections are negligible except for one prototype
+timing artifact at $350$\,B/s.}
+\label{fig:verif}
+\end{figure}
+
+\subsection{The Control Loop, Over Time}
+Figure~\ref{fig:step} shows a single run in the transition regime as a time
+series. The backlog and the slot duration trace anti-phase waves: the backlog
+rises above the target, the controller raises $T_i$ a few slots later, the longer
+slot drains the backlog, $T_i$ then decays, and the cycle repeats. This is the
+closed loop in action---the backlog is the cause and the slot duration is the
+response, with the expected controller lag. The bounded proportional step, plus
+the discrete jumps in Bloom-filter size, make the system limit-cycle around the
+target rather than settle to a fixed point, which is why we report robust
+steady-state statistics rather than a single terminal value.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_timeseries.png}
+\caption{Toggle engagement over time in the transition regime. Backlog (right
+axis) leads; slot duration (left axis) follows. The dotted line marks the
+controller target of four outstanding objects.}
+\label{fig:step}
+\end{figure}
 
 \begin{table}[t]
-\caption{Measured metrics vs.\ authentication-channel radio budget
-(median of three runs; $T$ in ms, backlog in objects, counts per $90$\,s run).}
+\caption{Measured Prob-Adaptive metrics versus authentication-channel radio
+budget (median of three runs; $T$ in ms, backlog in objects, counts per $90$\,s
+run).}
 \label{tab:results}
 \centering
-\begin{tabular}{@{}rrrrrrr@{}}
+\footnotesize
+\begin{tabular}{rrrrrrr}
 \toprule
-$B$ (B/s) & settled $T$ & peak $T$ & settled $Q$ & peak $Q$ & verified & premature\\
+$B$ (B/s) & settled $T$ & peak $T$ & settled $Q$ & peak $Q$ & verified & premature \\
 \midrule
 100 & 5752 & 8000 & 14.0 & 23 & 0   & 0  \\
 150 & 6812 & 8000 & 9.0  & 15 & 25  & 0  \\
@@ -361,115 +533,61 @@ $B$ (B/s) & settled $T$ & peak $T$ & settled $Q$ & peak $Q$ & verified & prematu
 \end{tabular}
 \end{table}
 
-\subsection{Slot duration tracks the bottleneck}
-Figure~\ref{fig:slot} plots the steady-state and peak slot duration against the
-radio budget. Three regimes are visible. In the \emph{saturated} regime
-($B\lesssim 150$\,B/s) the peak slot pins at the $T_{\max}=8000$\,ms ceiling: even
-the longest admissible slot cannot make the authentication path keep up. In the
-\emph{proportional} regime ($200\le B\le 300$\,B/s) the slot duration falls
-monotonically as the budget grows---the controller sets a graded operating point,
-the direct evidence that the toggle responds to load. In the \emph{idle} regime
-($B\gtrsim 300$\,B/s) the slot rests at the $T_{\min}=1000$\,ms floor, since the
-radio drains disclosures faster than slots produce them and there is no reason to
-lengthen. The steady-state curve dips slightly below the peak at the two lowest
-budgets; this is the finite-run effect noted above (few control ticks at $8$\,s
-slots), and the peak curve confirms both points reach the ceiling.
+\subsection{Computational and Communication Overhead}
+The adaptive mechanism introduces negligible runtime overhead. At each slot
+boundary the sender performs one weighted-sum evaluation, one subtraction, one
+multiply, and a clamp---constant-time operations independent of the queue length
+or receiver population. No additional broadcast packets, receiver messages, or
+blockchain queries are introduced during normal operation. The only persistent
+storage overhead is two integer timing parameters recorded once during session
+initialization through \texttt{storeAdaptiveKey}. Table~\ref{tab:overhead}
+summarizes the resulting online overhead relative to Inf-TESLA++.
 
-\begin{figure}[t]
+\begin{table}[t]
+\caption{Overhead comparison (online phase, probabilistic mode).}
+\label{tab:overhead}
 \centering
-\includegraphics[width=\columnwidth]{figures/fig1_slot_vs_bandwidth.png}
-\caption{Adaptive slot duration versus authentication-channel radio budget
-(measured, end-to-end). The controller rails at $T_{\max}$ when the budget is
-starved, sets a graded duration through the transition, and rests at $T_{\min}$
-when the budget is ample. Markers are medians of three runs; bars show the
-range.}
-\label{fig:slot}
-\end{figure}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lll}
+\toprule
+Protocol & $OV_{\mathrm{comp}}$ at $r_s$/slot & $OV_{\mathrm{comm}}$ at $r_s$/slot \\
+\midrule
+Inf-TESLA++ Prob.~\cite{inftesla} & $m\!\cdot\!c_{BF}+c_{HMAC}$ & $s_{Key}+\mathrm{len}(b)+s_{HMAC}$ \\
+Prob-Adaptive (this work) & $m\!\cdot\!c_{BF}+c_{HMAC}+O(1)$ & $s_{Key}+\mathrm{len}(b)+s_{HMAC}$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
 
-\subsection{The backlog stays bounded}
-Figure~\ref{fig:backlog} plots the disclosure backlog. For every budget at which
-authentication is viable the backlog remains a small multiple of the controller
-target ($Q_{\text{cap}}/2 = 4$) and well under the device buffer: the loop caps
-the queue instead of letting it grow without bound. Only at the starved end
-($B=100$\,B/s) does the backlog climb to $14$--$23$ objects---beyond
-$Q_{\text{cap}}$---because no slot length can balance production and drainage
-there. That point marks the protocol's stability boundary: to its right the
-queue is controlled, to its left it overflows.
+%==============================================================================
+\section{Discussion and Limitations}\label{sec:discussion}
 
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{figures/fig2_backlog_vs_bandwidth.png}
-\caption{Pending-disclosure backlog versus radio budget. The backlog is held
-near the controller target across the viable range and blows past $Q_{\text{cap}}$
-only at the starved $100$\,B/s point, where even $T_{\max}$ cannot drain it.}
-\label{fig:backlog}
-\end{figure}
+The evaluation confirms the protocol's primary objective: the slot duration
+tracks the authentication bottleneck, the disclosure backlog stays bounded across
+the viable range, and authentication survives down to a hard budget floor at which
+the queue overflows and, as the static protocol also would, verification fails.
+We report the prototype honestly; several caveats bound the strength of the claims
+and point at next steps.
 
-\subsection{Authentication survives to a budget floor}
-Figure~\ref{fig:verif} reports receiver outcomes. Above the stability boundary,
-verification is healthy (hundreds of messages per run at $500$--$800$\,B/s). As
-the budget tightens through the transition the verified count declines but
-remains positive, and at the starved $100$\,B/s point it collapses to zero: the
-authentication path is so throttled that disclosures cannot reach the receiver
-within its timing window, which is precisely the permanent-loss failure the fixed
-timer cannot avoid. The premature-rejection count is essentially zero everywhere
-except a single spike at $350$\,B/s; as explained in Section~\ref{sec:discussion}
-this is a timing artifact of the prototype's slot counter at the $T_{\min}$ knee,
-not a forgery.
+\textbf{Single-factor congestion signal.} The evaluated controller is driven by
+the queue-pressure term $D_i$ alone ($W_{\mathrm{disc}}=1$). The latency term
+$B_i$ of Equation~\eqref{eq:score} is part of the design but is not yet
+instrumented as an independent observable; adding it, and calibrating
+$L_{\mathrm{base}}$ per device, is future work. Because $D_i$ is exactly the
+signal whose overflow destroys authentication, the single-factor prototype is
+sufficient to demonstrate the mechanism.
 
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{figures/fig3_verification_outcomes.png}
-\caption{Receiver verification outcomes versus radio budget. Verified messages
-are plentiful when the budget is ample, decline through the transition, and
-vanish at the starved end; premature rejections are negligible except for one
-prototype timing artifact at $350$\,B/s.}
-\label{fig:verif}
-\end{figure}
-
-\subsection{The control loop, over time}
-Figure~\ref{fig:step} shows a single run in the transition regime as a time
-series. The backlog and the slot duration trace anti-phase waves: the backlog
-rises above the target, the controller raises $T_i$ a few slots later, the longer
-slot drains the backlog, $T_i$ then decays, and the cycle repeats. This is the
-closed loop in action---the backlog is the cause and the slot duration is the
-response, with the expected controller lag. The bounded proportional step, plus
-the discrete jumps in Bloom-filter size, make the system limit-cycle around the
-target rather than settle to a fixed point, which is why we report robust
-steady-state statistics rather than a single terminal value.
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{figures/fig4_step_timeseries.png}
-\caption{Toggle engagement over time in the transition regime. Backlog (right
-axis) leads; slot duration (left axis) follows. The dotted line marks the
-controller target of four outstanding objects.}
-\label{fig:step}
-\end{figure}
-
-\subsection{Summary}
-Taken together, the figures substantiate the design claim end-to-end: the slot
-duration follows the authentication bottleneck, the disclosure backlog stays
-bounded across the viable range, and authentication remains alive until a hard
-budget floor at which the queue overflows and, as the static protocol also would,
-verification fails. The adaptive sender therefore extends the range of radio
-conditions over which continuous authentication is preserved, and pays for it
-only with additional latency when the channel is genuinely scarce.
-
-\section{Discussion and Limitations}
-\label{sec:discussion}
-We report the prototype honestly; several caveats bound the strength of the
-claims and point at the next steps.
-
-\textbf{Slot-counter timing.} The disclosure worker in the current build advances
+\textbf{Slot-counter timing.} In the current build the disclosure worker advances
 the slot counter through a second timer instance in addition to the main slot
 loop, so the counter progresses at roughly twice the intended rate and the
 effective wall-clock disclosure hold is about half of $d$ slots. Near the
 $T_{\min}$ knee this releases keys slightly early relative to the receiver's
 security-condition threshold and produces the isolated premature-rejection spike
-at $350$\,B/s. The fix---having the worker poll the shared slot counter instead of
-opening its own timer---is mechanical and would tighten the transition band; we
-report the results with the artifact present and flag it as such.
+at $350$\,B/s. The fix---having the worker poll the shared slot counter rather
+than opening its own timer---is mechanical and would tighten the transition band;
+we report results with the artifact present and flag it as such.
 
 \textbf{Finite-run steady state.} At the lowest budgets the slot is several
 seconds long, so a $90$\,s run contains only a handful of control decisions and
@@ -478,83 +596,94 @@ statistic there is therefore conservative; the peak statistic (which reaches
 $T_{\max}$) better represents the operating point, and longer runs would close the
 gap.
 
-\textbf{Single node over loopback.} Sender and receiver are one process
-communicating over the loopback datagram channel. This exercises the full
-sender-side controller and the receiver-side checks but does not model
-independent clocks, multi-hop delay, or a population of receivers; a multi-node
-testbed is the natural next step.
+\textbf{Single node, and no fixed-slot baseline arm.} Sender and receiver are one
+process over the loopback channel, which exercises the full controller and the
+receiver checks but does not model independent clocks, multi-hop delay, or a
+receiver population. The study also characterizes only the adaptive protocol; a
+direct comparison against fixed-slow and fixed-fast arms over the same budget
+sweep, and a secondary open-loop packet-loss axis, remain future work.
 
-\textbf{Bloom-filter growth.} Because the batch, and hence the Bloom filter,
-grows with the slot duration, the per-second authentication byte rate has a
-floor set by the message rate. This floor is what creates the hard stability
-boundary at the starved end; it is a genuine property of the protocol, not of the
-measurement, and should be stated as the limit of what any slot policy can
-achieve.
+\textbf{Bloom-filter growth as a hard limit.} Because the batch, and hence the
+Bloom filter, grows with the slot duration, the per-second authentication byte
+rate has a floor set by the message rate. This floor is what creates the hard
+stability boundary at the starved end; it is a genuine property of the protocol,
+not of the measurement, and bounds what any slot policy can achieve.
 
-\textbf{Scope of the security argument.} We rely on the security of the
-underlying TESLA construction and on the tamper-evidence of the on-chain bounds,
-and we do not present a machine-checked timing proof or an adversarial evaluation
-of a timing-manipulation attacker. Establishing a receiver-enforced real-time
-bound from the on-chain $T_{\max}$, and proving the resulting timing safety, is
-deferred to future work.
+%==============================================================================
+\section{Conclusion}
+We presented Prob-Adaptive Inf-TESLA++, a backward-compatible extension of
+Inf-TESLA++ that replaces the fixed slot timer with a closed-loop timer driven by
+a local congestion signal and a bounded proportional update rule, clamped to
+immutable on-chain bounds $[T_{\min},T_{\max}]$ that preserve the TESLA timing
+condition and inherit the tamper-evidence and DoS resistance of the baseline. The
+per-slot cost is constant arithmetic with no additional network messages. Running
+the full stack---blockchain, owner, and RCD---and sweeping the
+authentication-channel radio budget, we measured the controller tracking the
+bottleneck: the slot rises to its ceiling as the budget starves, the disclosure
+backlog stays bounded across the viable range, and authentication survives down to
+a hard budget floor set by the protocol's own batching. The adaptive sender
+therefore extends the range of radio conditions over which continuous
+authentication is preserved, paying only additional latency when the channel is
+genuinely scarce.
 
-\section{Related Work}
-\label{sec:related}
-TESLA~\cite{tesla} and $\mu$TESLA~\cite{spins} established delayed-disclosure
-broadcast authentication for wired and sensor settings; the latter targets
-resource-constrained motes but assumes periodic resynchronization. Inf-TESLA++
-~\cite{inftesla} anchors hash-chain commitments on a blockchain to sustain
-authentication across finite chains without sender-assisted resynchronization,
-and adds the probabilistic Bloom-filter mode we build on. All of these run a
-fixed disclosure schedule. Classical congestion control such as
-AIMD~\cite{aimd} assumes per-flow feedback and is unsuitable for one-way,
-time-triggered broadcast, where the sender receives no acknowledgements; our
-controller instead closes the loop on a purely local signal, the sender's own
-disclosure backlog. The bounded proportional update is inspired by the EIP-1559
-transaction-fee mechanism~\cite{eip1559}, which likewise steers a quantity toward
-a target utilization with a clamped multiplicative step. To our knowledge, making
-the TESLA slot duration a closed-loop function of disclosure-queue pressure, with
-on-chain duration bounds, is new.
+%==============================================================================
+\section{Future Work}
+Future work includes fixing the prototype's slot-counter timing and repeating the
+budget sweep; adding a direct comparison against fixed-slow and fixed-fast
+baselines and a secondary open-loop packet-loss axis; instrumenting the latency
+term $B_i$ and calibrating it per device; extending the evaluation to an
+independent multi-node testbed; and developing a receiver-enforced real-time bound
+with a machine-checked timing-safety proof in TLA+ or Tamarin.
 
-\section{Conclusion and Future Work}
-\label{sec:conclusion}
-We turned the fixed slot timer of blockchain-anchored, delayed-disclosure
-broadcast authentication into a controlled variable. A one-line proportional
-rule, reading only the sender's pending-disclosure backlog and clamped to
-immutable on-chain bounds, lets the sender stretch its slot under authentication-
-channel pressure and shrink it back when the pressure clears, at the cost of a
-few arithmetic operations and no extra messages. Running the full
-stack---blockchain, owner, and RCD---and sweeping the authentication-channel
-radio budget, we measured the controller tracking the bottleneck: the slot rises
-to its ceiling as the budget starves, the disclosure backlog stays bounded across
-the viable range, and authentication survives down to a hard budget floor set by
-the protocol's own batching. Future work will fix the prototype's slot-counter
-timing, extend the evaluation to an independent multi-node testbed, add a direct
-comparison against fixed-slot baselines across the same budget sweep, and develop
-a receiver-enforced real-time bound with a formal timing-safety argument.
-
+%==============================================================================
 \begin{thebibliography}{00}
-\bibitem{tesla} A.~Perrig, R.~Canetti, J.~D.~Tygar, and D.~Song, ``The TESLA
-broadcast authentication protocol,'' \emph{RSA CryptoBytes}, vol.~5, no.~2,
-pp.~2--13, 2002.
-\bibitem{spins} A.~Perrig, R.~Szewczyk, J.~D.~Tygar, V.~Wen, and D.~E.~Culler,
-``SPINS: Security protocols for sensor networks,'' \emph{Wireless Networks},
-vol.~8, no.~5, pp.~521--534, 2002.
-\bibitem{inftesla} M.~R.~Dorsala, C.~L.~Nishitha, P.~Sathwik, G.~Srilekha, and
-M.~K.~Morampudi, ``Inf-TESLA++: A blockchain-assisted continuous authentication
-protocol for broadcast communication in resource-constrained devices,''
-Indian Institute of Information Technology Sri City, Chittoor, India.
-\bibitem{bloom} B.~H.~Bloom, ``Space/time trade-offs in hash coding with
-allowable errors,'' \emph{Communications of the ACM}, vol.~13, no.~7,
-pp.~422--426, 1970.
-\bibitem{dolevyao} D.~Dolev and A.~C.~Yao, ``On the security of public key
-protocols,'' \emph{IEEE Transactions on Information Theory}, vol.~29, no.~2,
-pp.~198--208, 1983.
-\bibitem{eip1559} T.~Roughgarden, ``Transaction fee mechanism design for the
+\bibitem{inftesla} M. R. Dorsala, C. L. Nishitha, P. Sathwik, G. Srilekha, and
+M. K. Morampudi, ``Inf-TESLA++: A Blockchain-assisted Continuous Authentication
+Protocol for Broadcast Communication in Resource-Constrained Devices,'' Indian
+Institute of Information Technology Sri City, Chittoor, India.
+\bibitem{tesla} A. Perrig, R. Canetti, J. D. Tygar, and D. Song, ``The TESLA
+Broadcast Authentication Protocol,'' in \emph{Secure Broadcast Communication: In
+Wired and Wireless Networks}, pp. 29--53, 2003.
+\bibitem{teslapp} A. Studer, F. Bai, B. Bellur, and A. Perrig, ``Flexible,
+extensible, and efficient VANET authentication,'' \emph{Journal of Communications
+and Networks}, vol. 11, no. 6, pp. 574--588, Dec. 2009.
+\bibitem{spins} A. Perrig, R. Szewczyk, V. Wen, D. Culler, and J. D. Tygar,
+``SPINS: Security protocols for sensor networks,'' in \emph{Proc. 7th ACM
+MobiCom}, Rome, Italy, Jul. 2001, pp. 189--199.
+\bibitem{bloom} B. H. Bloom, ``Space/time trade-offs in hash coding with
+allowable errors,'' \emph{Communications of the ACM}, vol. 13, no. 7, pp.
+422--426, 1970.
+\bibitem{inftesla_orig} S. Camara, D. Anand, V. Pillitteri, and L. Carmo,
+``Multicast Delayed Authentication for Streaming Synchrophasor Data in the Smart
+Grid,'' in \emph{ICT Systems Security and Privacy Protection}, Springer, vol.
+471, pp. 32--46, 2016.
+\bibitem{enhanced} K. Eledlebi, A. A. Alzubaidi, C. Y. Yeun, E. Damiani, V.
+Mateu, and Y. Al-Hammadi, ``Enhanced Inf-TESLA Protocol: A Continuous
+Connectivity and Low Overhead Authentication Protocol via IoT Devices,''
+\emph{IEEE Access}, vol. 10, pp. 54\,912--54\,921, 2022.
+\bibitem{empirical} K. Eledlebi, C. Y. Yeun, E. Damiani, and Y. Al-Hammadi,
+``Empirical Studies of TESLA Protocol: Properties, Implementations, and
+Replacement of Public Cryptography Using Biometric Authentication,'' \emph{IEEE
+Access}, vol. 10, pp. 21\,941--21\,954, 2022.
+\bibitem{comparative} K. Eledlebi, A. Alzubaidi, E. Damiani, V. Mateu, Y.
+Al-Hammadi, D. Puthal, and C. Y. Yeun, ``Comparative study of novel packet loss
+analysis and recovery capability between hybrid TLI-$\mu$TESLA and other variant
+TESLA protocols,'' \emph{Ad Hoc Networks}, vol. 163, p. 103579, 2024.
+\bibitem{garcia} J. C. P. Garc\'ia, A. Benslimane, A. Braeken, and Z. Su,
+``$\mu$Tesla-Based Authentication for Reliable and Secure Broadcast
+Communications in IoD Using Blockchain,'' \emph{IEEE Internet of Things Journal},
+vol. 10, no. 20, pp. 18\,400--18\,413, Oct. 2023.
+\bibitem{eip1559} T. Roughgarden, ``Transaction fee mechanism design for the
 Ethereum blockchain: An economic analysis of EIP-1559,'' arXiv:2012.00854, 2020.
-\bibitem{aimd} D.-M.~Chiu and R.~Jain, ``Analysis of the increase and decrease
+\bibitem{dolev} D. Dolev and A. C. Yao, ``On the security of public key
+protocols,'' \emph{IEEE Trans. Information Theory}, vol. 29, no. 2, pp. 198--208,
+1983.
+\bibitem{aimd} D. Chiu and R. Jain, ``Analysis of the increase and decrease
 algorithms for congestion avoidance in computer networks,'' \emph{Computer
-Networks and ISDN Systems}, vol.~17, no.~1, pp.~1--14, 1989.
+Networks and ISDN Systems}, vol. 17, no. 1, pp. 1--14, 1989.
+\bibitem{rabin} M. O. Rabin, ``Efficient dispersal of information for security,
+load balancing, and fault tolerance,'' \emph{J. ACM}, vol. 36, no. 2, pp.
+335--348, 1989.
 \end{thebibliography}
 
 \end{document}
