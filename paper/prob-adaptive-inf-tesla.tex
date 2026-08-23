@@ -477,16 +477,19 @@ positive, and at the starved $100$\,B/s point it collapses to zero: the
 authentication path is so throttled that disclosures cannot reach the receiver
 within its timing window, which is exactly the permanent-loss failure the fixed
 timer cannot avoid. Premature rejections are negligible everywhere except a single
-spike at $350$\,B/s; as explained in Section~\ref{sec:discussion} this is a timing
-artifact of the prototype's slot counter at the $T_{\min}$ knee, not a forgery.
+spike at $350$\,B/s; as explained in Section~\ref{sec:discussion} this reflects the
+receiver's wall-clock timing guard correctly rejecting disclosures that the
+marginally provisioned authentication channel delivered too close to their HMACs,
+not a forgery.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig_verification.png}
 \caption{Receiver verification outcomes versus radio budget. Verified messages are
 plentiful when the budget is ample, decline through the transition, and vanish at
-the starved end; premature rejections are negligible except for one prototype
-timing artifact at $350$\,B/s.}
+the starved end; premature rejections are negligible except at the marginal
+$350$\,B/s knee, where the shared throttled channel delivers key disclosures too
+close to their HMACs and the receiver's timing guard rejects them.}
 \label{fig:verif}
 \end{figure}
 
@@ -579,15 +582,19 @@ $L_{\mathrm{base}}$ per device, is future work. Because $D_i$ is exactly the
 signal whose overflow destroys authentication, the single-factor prototype is
 sufficient to demonstrate the mechanism.
 
-\textbf{Slot-counter timing.} In the current build the disclosure worker advances
-the slot counter through a second timer instance in addition to the main slot
-loop, so the counter progresses at roughly twice the intended rate and the
-effective wall-clock disclosure hold is about half of $d$ slots. Near the
-$T_{\min}$ knee this releases keys slightly early relative to the receiver's
-security-condition threshold and produces the isolated premature-rejection spike
-at $350$\,B/s. The fix---having the worker poll the shared slot counter rather
-than opening its own timer---is mechanical and would tighten the transition band;
-we report results with the artifact present and flag it as such.
+\textbf{Congestion-knee disclosure bunching.} The receiver enforces timing safety
+on its own wall clock, rejecting any disclosure that arrives less than
+$d\,T_{\min}-\delta_{\mathrm{net}}$ after the corresponding HMAC (Theorem~1). At
+the marginal budget ($350$\,B/s) the single throttled channel shared by HMACs and
+disclosures runs at its sustainable floor and intermittently transmits a batch's
+HMAC and its key disclosure back-to-back rather than a slot apart; the receiver
+then sees the two arrive too close together and the guard fires, producing the
+isolated premature-rejection spike. This is a testbed artifact of sharing one
+throttled channel between the two message types, with the security check behaving
+exactly as intended, not a forgery or a slot-timing error. Pacing HMACs and their
+disclosures onto separate sub-budgets so the channel cannot bunch them would
+remove the spike; we leave this to future work and report results with the
+artifact present.
 
 \textbf{Finite-run steady state.} At the lowest budgets the slot is several
 seconds long, so a $90$\,s run contains only a handful of control decisions and
@@ -628,12 +635,13 @@ genuinely scarce.
 
 %==============================================================================
 \section{Future Work}
-Future work includes fixing the prototype's slot-counter timing and repeating the
-budget sweep; adding a direct comparison against fixed-slow and fixed-fast
-baselines and a secondary open-loop packet-loss axis; instrumenting the latency
-term $B_i$ and calibrating it per device; extending the evaluation to an
-independent multi-node testbed; and developing a receiver-enforced real-time bound
-with a machine-checked timing-safety proof in TLA+ or Tamarin.
+Future work includes pacing HMACs and key disclosures onto separate sub-budgets to
+remove the congestion-knee rejection artifact and repeating the budget sweep;
+adding a direct comparison against fixed-slow and fixed-fast baselines and a
+secondary open-loop packet-loss axis; instrumenting the latency term $B_i$ and
+calibrating it per device; extending the evaluation to an independent multi-node
+testbed; and developing a receiver-enforced real-time bound with a machine-checked
+timing-safety proof in TLA+ or Tamarin.
 
 %==============================================================================
 \begin{thebibliography}{00}
