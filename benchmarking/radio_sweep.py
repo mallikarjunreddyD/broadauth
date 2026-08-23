@@ -44,13 +44,13 @@ def uuid_pool(path):
         return [ln.strip() for ln in f if pat.match(ln.strip())]
 
 
-def run_one(uid, bps, duration, log_path):
+def run_one(uid, bps, duration, log_path, tmin=TMIN, tmax=TMAX):
     with open(log_path, "w") as f:
         proc = subprocess.Popen(
             [RCD_BIN, "-contract", CONTRACT, "-eth-url", ETH_URL,
              "-owner-addr", OWNER_ADDR, "-uuid", uid,
              "-hashchain-len", HASHCHAIN_LEN, "-disclosure-delay", DISCLOSURE_DELAY,
-             "-mode", "probabilistic", "-adaptive", "-tmin", TMIN, "-tmax", TMAX,
+             "-mode", "probabilistic", "-adaptive", "-tmin", str(tmin), "-tmax", str(tmax),
              "-msg-rate", MSG_RATE, "-radio-bps", str(bps), "-bench",
              "-simulation-time", f"{duration + 5}s"],
             stdout=f, stderr=subprocess.STDOUT)
@@ -129,6 +129,12 @@ def main():
     bps_list = ([int(x) for x in sys.argv[2].split(",")]
                 if len(sys.argv) > 2 else DEFAULT_BPS)
     iters = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+    tmin = sys.argv[4] if len(sys.argv) > 4 else TMIN
+    tmax = sys.argv[5] if len(sys.argv) > 5 else TMAX
+    # optional arm label -> namespaces the JSON and per-run logs so multiple
+    # arms (adaptive / fixed_fast / fixed_slow) don't overwrite each other.
+    suffix = sys.argv[6] if len(sys.argv) > 6 else ""
+    tag = f"_{suffix}" if suffix else ""
     os.makedirs(OUT_DIR, exist_ok=True)
     pool = uuid_pool(OWNER_LOG)
     need = len(bps_list) * iters
@@ -136,16 +142,17 @@ def main():
         print(f"[!] only {len(pool)} UUIDs for {need} runs"); sys.exit(1)
 
     results = {"duration_s": duration, "msg_rate": int(MSG_RATE), "iters": iters,
-               "tmin": int(TMIN), "tmax": int(TMAX), "runs": {}}
-    print(f"[*] sweep: duration={duration}s  iters={iters}  bps={bps_list}")
+               "tmin": int(tmin), "tmax": int(tmax), "arm": suffix or "adaptive", "runs": {}}
+    print(f"[*] sweep: duration={duration}s iters={iters} tmin={tmin} tmax={tmax} "
+          f"arm={suffix or 'adaptive'} bps={bps_list}")
     k = 0
     for bps in bps_list:
         per_iter = []
         for it in range(iters):
             uid = pool[k]; k += 1
-            log_path = f"{OUT_DIR}/rcd_{bps}bps_i{it}.log"
+            log_path = f"{OUT_DIR}/rcd{tag}_{bps}bps_i{it}.log"
             print(f"  {bps} B/s  iter {it+1}/{iters}  (uuid {uid[:8]}) ...", flush=True)
-            run_one(uid, bps, duration, log_path)
+            run_one(uid, bps, duration, log_path, tmin, tmax)
             r = parse(log_path)
             if r is None:
                 print("      no ticks parsed!"); continue
@@ -159,7 +166,7 @@ def main():
                   f"(iters {['%.0f'%x for x in agg['settled_t_iters']]}) "
                   f"verified~{agg['verified']:.0f}")
 
-    path = f"{OUT_DIR}/radio_sweep.json"
+    path = f"{OUT_DIR}/radio_sweep{tag}.json"
     with open(path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"[*] wrote {path}")

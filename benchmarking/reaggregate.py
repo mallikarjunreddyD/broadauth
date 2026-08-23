@@ -12,8 +12,11 @@ matters at low budgets where an 8 s slot yields only a handful of ticks).
 import glob
 import json
 import re
+import sys
 
-OUT = "results/e2e/radio_sweep.json"
+SUFFIX = sys.argv[1] if len(sys.argv) > 1 else ""
+TAG = f"_{SUFFIX}" if SUFFIX else ""
+OUT = f"results/e2e/radio_sweep{TAG}.json"
 RE_TICK = re.compile(r"\[PROB-ADAPTIVE\].*T_cur=(\d+)ms U_cur=[\d.]+ Qlen=(\d+)")
 RE_BENCH = re.compile(r"\|\s*(\d+)\s*\|\s*(\d+)\s*$")
 TAIL = 0.40  # fraction of the run (from the end) treated as steady state
@@ -45,7 +48,7 @@ def parse(path):
 def main():
     d = json.load(open(OUT))
     for bps in list(d["runs"]):
-        logs = sorted(glob.glob(f"results/e2e/rcd_{bps}bps_i*.log"))
+        logs = sorted(glob.glob(f"results/e2e/rcd{TAG}_{bps}bps_i*.log"))
         per = [parse(p) for p in logs]
         per = [r for r in per if r]
         if not per:

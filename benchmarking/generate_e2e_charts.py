@@ -13,13 +13,15 @@ anvil+cm+owner+RCD stack) and renders publication figures to plots/e2e/:
 """
 import json
 import os
+import sys
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-IN = "results/e2e/radio_sweep.json"
-OUT = "plots/e2e"
+# Optional args: [input_json] [output_dir]. Defaults reproduce the adaptive set.
+IN = sys.argv[1] if len(sys.argv) > 1 else "results/e2e/radio_sweep.json"
+OUT = sys.argv[2] if len(sys.argv) > 2 else "plots/e2e"
 BLUE, ORANGE, GREY, RED, GREEN = "#2e6fbf", "#e08a1e", "#7f8c8d", "#c0392b", "#2e8b57"
 
 
