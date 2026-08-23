@@ -638,7 +638,10 @@ func (r *RCD) broadcastDeterministic(data []byte) error {
 	}
 
 	startBroadcast := time.Now()
-	err = r.broadcaster.Broadcast(r.ctx, hmacData)
+	// Deterministic-mode HMAC also rides the prompt control plane (see the
+	// probabilistic flushBatch for the rationale); only key disclosures are
+	// metered against the radio budget.
+	err = r.broadcaster.BroadcastUnthrottled(r.ctx, hmacData)
 	if r.enableBenchmarking {
 		atomic.AddInt64(&r.metrics.BroadcastDuration, time.Since(startBroadcast).Nanoseconds())
 		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
@@ -729,7 +732,14 @@ func (r *RCD) flushBatch(slot uint64) error {
 	}
 
 	startBroadcast := time.Now()
-	err = r.broadcaster.Broadcast(r.ctx, hmacBytes)
+	// The batch-commitment HMAC rides the prompt control plane, not the
+	// metered radio budget. The HMAC is a small per-slot commitment; only the
+	// bandwidth-heavy key disclosure (Bloom filter + key) is metered as the
+	// constrained radio. Keeping the HMAC off the throttle stops it from being
+	// queued behind a large disclosure, which would delay its arrival, start
+	// the receiver's timing stopwatch late, and compress the observed
+	// HMAC->disclosure gap below the security threshold at the congestion knee.
+	err = r.broadcaster.BroadcastUnthrottled(r.ctx, hmacBytes)
 	if r.enableBenchmarking {
 		atomic.AddInt64(&r.metrics.BroadcastDuration, time.Since(startBroadcast).Nanoseconds())
 		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
