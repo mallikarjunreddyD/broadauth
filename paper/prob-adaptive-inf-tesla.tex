@@ -396,14 +396,19 @@ bindings; all existing functions are untouched, so a non-adaptive deployment is
 unchanged.
 
 To characterize the controller against the resource whose overflow actually
-destroys authentication, the implementation models a shared but budget-limited
-radio. Authentication traffic (HMACs and key disclosures) is transmitted over a
-throttled path limited to a configurable byte rate, while application data is
-carried on an unthrottled plane; the throttle serializes authentication sends and
-blocks each for its modelled transmission time. This isolates the disclosure
-pipeline as the bottleneck the controller relieves and makes the radio budget the
-single independent variable, with no dependence on operating-system traffic
-shaping.
+destroys authentication, the implementation models a budget-limited radio and
+meters the \emph{key-disclosure} channel: each disclosure (the Bloom filter plus
+key, the bandwidth-heavy object whose loss is irrecoverable) is transmitted over
+a throttled path limited to a configurable byte rate, and the throttle serializes
+disclosure sends and blocks each for its modelled transmission time. The small
+per-slot batch-commitment HMAC and the application data ride an unthrottled
+control plane. Keeping the HMAC prompt matters for measurement fidelity: the
+receiver's timing guard (Theorem~1) starts its wall-clock
+stopwatch when it receives a batch's HMAC, so if the HMAC were queued behind a
+large disclosure it would arrive late and spuriously compress the observed
+HMAC-to-disclosure interval. Metering only the disclosure channel isolates the
+pipeline the controller relieves, makes the radio budget the single independent
+variable, and removes any dependence on operating-system traffic shaping.
 
 \subsection{Experimental Setup}
 Every measurement runs the complete system: a local Ethereum node, the consortium
@@ -414,7 +419,7 @@ traffic, so a single node exercises both the sender-side controller and the
 receiver-side checks.
 
 We sweep the authentication-channel radio budget $B$ (bytes/second) over
-$\{100,150,200,250,300,350,500,800\}$. For each budget the RCD runs for $90$\,s
+$\{50,80,120,160,200,260,350,600\}$. For each budget the RCD runs for $90$\,s
 at an application message rate of $50$\,msg/s, with $T_{\min}=1000$\,ms,
 $T_{\max}=8000$\,ms, disclosure delay $d=2$, target $C^{\ast}=0.5$, gain
 $\alpha=0.25$, capacity $Q_{\mathrm{cap}}=8$, and hash-chain length $512$. Each
@@ -429,17 +434,17 @@ slots, robust to the ramp and to the controller's limit cycle).
 \subsection{Slot Duration Tracks the Bottleneck}
 Figure~\ref{fig:slot} plots the steady-state and peak slot duration against the
 radio budget, and Table~\ref{tab:results} lists the values. Three regimes are
-visible. In the \emph{saturated} regime ($B\lesssim 150$\,B/s) the peak slot pins
-at the $T_{\max}=8000$\,ms ceiling: even the longest admissible slot cannot make
-the authentication path keep up. In the \emph{proportional} regime ($200\le B\le
-300$\,B/s) the slot duration falls monotonically as the budget grows---the
-controller sets a graded operating point, the direct evidence that the toggle
-responds to load. In the \emph{idle} regime ($B\gtrsim 300$\,B/s) the slot rests
-at the $T_{\min}=1000$\,ms floor, since the radio drains disclosures faster than
-slots produce them. The steady-state curve dips slightly below the peak at the two
-lowest budgets; this is a finite-run effect (at $8$\,s slots a $90$\,s run
-contains few control ticks), and the peak curve confirms both points reach the
-ceiling.
+visible. In the \emph{saturated} regime ($B\lesssim 80$\,B/s) the slot pins at the
+$T_{\max}=8000$\,ms ceiling: even the longest admissible slot cannot make the
+disclosure channel keep up. In the \emph{proportional} regime ($120\le B\le
+200$\,B/s) the slot duration falls monotonically and smoothly as the budget grows,
+from $3746$\,ms down to $1058$\,ms---the controller sets a graded operating point,
+the direct evidence that the toggle responds to load. In the \emph{idle} regime
+($B\gtrsim 260$\,B/s) the slot rests at the $T_{\min}=1000$\,ms floor, since the
+radio drains disclosures faster than slots produce them. The steady-state and peak
+curves nearly coincide, and the three independent runs at each budget agree to
+within a few percent (Table~\ref{tab:results} reports the medians), so the
+characteristic is stable and repeatable.
 
 \begin{figure}[t]
 \centering
@@ -452,13 +457,14 @@ when the budget is ample. Markers are medians of three runs; bars show the range
 \end{figure}
 
 \subsection{The Backlog Stays Bounded}
-Figure~\ref{fig:backlog} plots the disclosure backlog. For every budget at which
-authentication is viable, the backlog remains a small multiple of the controller
-target ($Q_{\mathrm{cap}}/2=4$) and well under the device buffer: the loop caps
-the queue instead of letting it grow without bound. Only at the starved end
-($B=100$\,B/s) does the backlog climb to $14$--$23$ objects, beyond
-$Q_{\mathrm{cap}}$, because no slot length can balance production and drainage
-there. That point marks the protocol's stability boundary.
+Figure~\ref{fig:backlog} plots the disclosure backlog. Across the proportional and
+idle regimes the backlog holds right at the controller target
+($Q_{\mathrm{cap}}/2=4$) or below, well under the device buffer: the loop caps the
+queue instead of letting it grow without bound. Only in the saturated regime
+($B\le 80$\,B/s) does the backlog climb past $Q_{\mathrm{cap}}$ (to $10$--$12$
+objects), because no slot length can balance production and drainage there. The
+knee near $80$--$120$\,B/s therefore marks the protocol's stability boundary:
+to its right the queue is controlled, to its left it overflows.
 
 \begin{figure}[t]
 \centering
@@ -470,26 +476,26 @@ at the starved $100$\,B/s point, where even $T_{\max}$ cannot drain it.}
 \end{figure}
 
 \subsection{Authentication Survives to a Budget Floor}
-Figure~\ref{fig:verif} reports receiver outcomes. Above the stability boundary,
-verification is healthy (hundreds of messages per run at $500$--$800$\,B/s). As
-the budget tightens through the transition the verified count declines but stays
-positive, and at the starved $100$\,B/s point it collapses to zero: the
-authentication path is so throttled that disclosures cannot reach the receiver
-within its timing window, which is exactly the permanent-loss failure the fixed
-timer cannot avoid. Premature rejections are negligible everywhere except a single
-spike at $350$\,B/s; as explained in Section~\ref{sec:discussion} this reflects the
-receiver's wall-clock timing guard correctly rejecting disclosures that the
-marginally provisioned authentication channel delivered too close to their HMACs,
-not a forgery.
+Figure~\ref{fig:verif} reports receiver outcomes. Above the stability boundary
+verification is healthy---hundreds of messages per run at $260$--$600$\,B/s. As
+the budget tightens through the transition the verified count declines
+monotonically and, in the saturated regime, degrades sharply to a small residue
+($15$--$17$ messages per run at $50$--$80$\,B/s): the disclosure channel is so
+throttled that most batches' evidence cannot reach the receiver within its timing
+window, which is the permanent-loss failure the fixed timer cannot avoid.
+Premature rejections are \emph{zero at every budget}: because the batch HMAC is
+delivered promptly on the control plane, the receiver's wall-clock timing guard
+sees each key disclosure at the intended $d$-slot spacing and never mistakes an
+honest disclosure for an early one.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig_verification.png}
 \caption{Receiver verification outcomes versus radio budget. Verified messages are
-plentiful when the budget is ample, decline through the transition, and vanish at
-the starved end; premature rejections are negligible except at the marginal
-$350$\,B/s knee, where the shared throttled channel delivers key disclosures too
-close to their HMACs and the receiver's timing guard rejects them.}
+plentiful when the budget is ample, decline through the transition, and drop to a
+small residue at the starved end; premature rejections are zero at every budget,
+since the promptly-delivered control-plane HMAC keeps the receiver's timing
+reference undistorted.}
 \label{fig:verif}
 \end{figure}
 
@@ -524,14 +530,14 @@ run).}
 \toprule
 $B$ (B/s) & settled $T$ & peak $T$ & settled $Q$ & peak $Q$ & verified & premature \\
 \midrule
-100 & 5752 & 8000 & 14.0 & 23 & 0   & 0  \\
-150 & 6812 & 8000 & 9.0  & 15 & 25  & 0  \\
-200 & 1816 & 5086 & 1.5  & 11 & 42  & 0  \\
-250 & 1219 & 2671 & 5.0  & 8  & 42  & 0  \\
-300 & 1000 & 1731 & 4.0  & 6  & 50  & 0  \\
-350 & 1000 & 1000 & 1.0  & 2  & 44  & 68 \\
-500 & 1000 & 1000 & 1.0  & 2  & 384 & 1  \\
-800 & 1000 & 1000 & 2.0  & 2  & 378 & 1  \\
+50  & 8000 & 8000 & 10.0 & 12 & 17  & 0 \\
+80  & 6433 & 8000 & 7.0  & 9  & 15  & 0 \\
+120 & 3746 & 3746 & 4.0  & 8  & 44  & 0 \\
+160 & 1613 & 2014 & 4.0  & 6  & 66  & 0 \\
+200 & 1058 & 1239 & 4.0  & 5  & 102 & 0 \\
+260 & 1000 & 1000 & 1.0  & 2  & 374 & 0 \\
+350 & 1000 & 1000 & 1.0  & 2  & 391 & 0 \\
+600 & 1000 & 1000 & 2.0  & 2  & 369 & 0 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -582,20 +588,6 @@ $L_{\mathrm{base}}$ per device, is future work. Because $D_i$ is exactly the
 signal whose overflow destroys authentication, the single-factor prototype is
 sufficient to demonstrate the mechanism.
 
-\textbf{Congestion-knee disclosure bunching.} The receiver enforces timing safety
-on its own wall clock, rejecting any disclosure that arrives less than
-$d\,T_{\min}-\delta_{\mathrm{net}}$ after the corresponding HMAC (Theorem~1). At
-the marginal budget ($350$\,B/s) the single throttled channel shared by HMACs and
-disclosures runs at its sustainable floor and intermittently transmits a batch's
-HMAC and its key disclosure back-to-back rather than a slot apart; the receiver
-then sees the two arrive too close together and the guard fires, producing the
-isolated premature-rejection spike. This is a testbed artifact of sharing one
-throttled channel between the two message types, with the security check behaving
-exactly as intended, not a forgery or a slot-timing error. Pacing HMACs and their
-disclosures onto separate sub-budgets so the channel cannot bunch them would
-remove the spike; we leave this to future work and report results with the
-artifact present.
-
 \textbf{Finite-run steady state.} At the lowest budgets the slot is several
 seconds long, so a $90$\,s run contains only a handful of control decisions and
 the slot is still climbing toward the ceiling when the run ends. The steady-state
@@ -635,13 +627,11 @@ genuinely scarce.
 
 %==============================================================================
 \section{Future Work}
-Future work includes pacing HMACs and key disclosures onto separate sub-budgets to
-remove the congestion-knee rejection artifact and repeating the budget sweep;
-adding a direct comparison against fixed-slow and fixed-fast baselines and a
-secondary open-loop packet-loss axis; instrumenting the latency term $B_i$ and
-calibrating it per device; extending the evaluation to an independent multi-node
-testbed; and developing a receiver-enforced real-time bound with a machine-checked
-timing-safety proof in TLA+ or Tamarin.
+Future work includes adding a direct comparison against fixed-slow and fixed-fast
+baselines and a secondary open-loop packet-loss axis; instrumenting the latency
+term $B_i$ and calibrating it per device; extending the evaluation to an
+independent multi-node testbed; and developing a receiver-enforced real-time bound
+with a machine-checked timing-safety proof in TLA+ or Tamarin.
 
 %==============================================================================
 \begin{thebibliography}{00}
